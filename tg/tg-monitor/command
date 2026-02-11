@@ -1,0 +1,5 @@
+# 构建并后台启动
+docker-compose up -d --build
+
+# 查看实时日志（确认是否报错）
+docker-compose logs -f

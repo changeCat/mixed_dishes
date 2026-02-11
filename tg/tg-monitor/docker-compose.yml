@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  tg-upload-bot:
+    build: .
+    container_name: tg_channel_uploader
+    restart: always
+    environment:
+      # --- Telegram 配置 ---
+      - API_ID=1234567               # 替换你的 API ID
+      - API_HASH=your_api_hash       # 替换你的 API Hash
+      - BOT_TOKEN=123456:ABCDEF...  # 替换 BotFather 给的 Token
+      - CHANNEL_ID=@your_channel     # 监听的频道用户名 或 ID
+      
+      # --- 图床配置 (以 SM.MS 为例) ---
+      - UPLOAD_URL=https://sm.ms/api/v2/upload
+      # 如果是 EasyImage/Chevereto，通常是 https://domain.com/api/index.php
+      
+      - UPLOAD_TOKEN=your_token_here # 图床 API Token
+      
+      # 控制 Python 立即输出日志
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # 挂载 session 目录，重启后无需重新认证
+      - ./session_data:/app/session
