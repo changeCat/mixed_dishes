@@ -11,7 +11,7 @@ export default {
         if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.TG_BOT_SECRET && env.TG_BOT_SECRET) {
           return new Response("Unauthorized", { status: 403 });
         }
-        ctx.waitUntil(handleUpdate(payload, env));
+        ctx.waitUntil(handleUpdate(payload, env, ctx));
         return new Response("OK", { status: 200 });
       } catch (e) {
         return new Response("Error", { status: 500 });
@@ -40,86 +40,134 @@ function getDirs(env) {
 
 // --- 核心逻辑 ---
 
-async function handleUpdate(update, env) {
-  // 1. 鉴权
+async function handleUpdate(update, env, ctx) {
+  // ==============================
+  // 1. 初始解析与鉴权
+  // ==============================
   let userId = null;
   let chatId = null;
+  let chatType = null;
   let msg = null;
-  
+
+  // 解析消息来源
   if (update.message) {
     msg = update.message;
     userId = msg.from.id;
     chatId = msg.chat.id;
+    chatType = msg.chat.type; // "private", "group", "supergroup"
+  } else if (update.channel_post) {
+    msg = update.channel_post;
+    chatId = msg.chat.id;
+    userId = chatId; // 频道没有具体用户，用频道ID鉴权
+    chatType = "channel";
   } else if (update.callback_query) {
-    userId = update.callback_query.from.id;
-    chatId = update.callback_query.message.chat.id;
-  } else {
-    return;
-  }
-
-  const allowedUsers = (env.ALLOWED_USERS || "").split(",").map(id => id.trim());
-  if (!allowedUsers.includes(String(userId))) {
-    if (update.message) await sendTelegramMessage(chatId, "🚫 无权使用。", env);
-    return;
-  }
-
-  // 2. 回调处理
-  if (update.callback_query) {
+    // 按钮回调优先处理，因为它是交互操作，不属于“命令/消息”分类
     await handleCallback(update.callback_query, env);
     return;
+  } else {
+    return; // 未知更新类型，忽略
   }
 
-// 3. /list 指令
-  if (msg && msg.text && msg.text.startsWith("/list")) {
-    const dirs = getDirs(env);
-    if (dirs.length === 0) {
-      await sendTelegramMessage(chatId, "❌ 未配置 `DIR_LIST`", env);
-      return;
-    }
-    // 修改处：传入 msg.message_id，作为 cmdId 传递
-    await sendDirectoryBrowser(chatId, dirs, env, msg.message_id);
+  // 鉴权 (检查 ALLOWED_USERS)
+  const allowedUsers = (env.ALLOWED_USERS || "").split(",").map(id => id.trim());
+  // 注意：如果是频道消息，这里的 userId 就是频道 ID
+  if (!allowedUsers.includes(String(userId))) {
     return;
   }
 
-  // 3a. /reset - 清空 KV 缓存 (解决卡顿/状态错误)
-  if (msg && msg.text === "/reset") {
+  // 提取文本，防止后续重复提取
+  const text = msg.text || msg.caption || "";
+
+  // ==============================
+  // 2. 核心分流逻辑 (If / Else)
+  // ==============================
+
+  if (chatType === "private") {
+    // ————————————————
+    // 🅰️ 私聊分支 (Private)
+    // 包含：所有管理命令 + 文件上传
+    // ————————————————
+
+    // 0. /init - 初始化/更新命令提示
+    if (text === "/init") {
+        await sendTelegramMessage(chatId, "🔄 正在强制刷新命令菜单...", env);
+        try {
+            // 注意：这里传入了 chatId
+            const success = await setupBotCommands(env, chatId); 
+            if (success) {
+                await sendTelegramMessage(chatId, "✅ **刷新成功！**\n\n如果菜单未变化，请尝试：\n1. 完全关闭 Telegram App 进程并重启。\n2. 删除与机器人的对话框重新进入。", env);
+            } else {
+                await sendTelegramMessage(chatId, "❌ 部分接口调用失败，请检查日志。", env);
+            }
+        } catch (e) {
+            await sendTelegramMessage(chatId, `❌ 出错: ${e.message}`, env);
+        }
+        return;
+    }
+
+    // 1. /list - 浏览目录
+    if (text.startsWith("/list")) {
+      const dirs = getDirs(env);
+      if (dirs.length === 0) {
+        await sendTelegramMessage(chatId, "❌ 未配置 `DIR_LIST`", env);
+        return;
+      }
+      await sendDirectoryBrowser(chatId, dirs, env, msg.message_id);
+      return;
+    }
+
+    // 2. /reset - 重置 KV
+    if (text === "/reset") {
       await sendTelegramMessage(chatId, "⏳ 正在重置上传状态...", env);
       const count = await clearAllKV(env);
       await sendTelegramMessage(chatId, `✅ 上传已重置。\n🗑 已清理 ${count} 条临时缓存。`, env);
       return;
-  }
-
-  // 3b. /clean - 清理消息 (视觉清理)
-  if (msg && msg.text === "/clean") {
-      // 1. 如果是回复某条消息，先删除那条被回复的消息 (通常是报错面板)
-      if (msg.reply_to_message) {
-          await deleteMessage(chatId, msg.reply_to_message.message_id, env);
-      }
-      // 2. 删除 /clean 命令本身
-      await deleteMessage(chatId, msg.message_id, env);
-      return;
-  }
-
-  // 3c. /random - 随机图面板 (修复版)
-  if (msg && msg.text === "/random") {
-      // 传入 msg.message_id，以便后续关闭面板时删除这条命令
-      await sendRandomPanel(chatId, "all", env, msg.message_id);
-      return;
-  }
-
-  // 4. 文件上传入口
-  const mediaInfo = getMediaInfo(msg);
-  if (mediaInfo) {
-    // 4a. 批量组处理 (Batch)
-    if (msg.media_group_id && env.TG_KV) {
-        await handleBatchPreProcess(msg, mediaInfo, env);
-        return;
     }
 
-    // 4b. 单文件处理 - 直接发送统一面板
-    const channels = getChannels(env);
-    const defaultChannel = channels[0].value; // 默认选中第一个
-    await sendUnifiedPanel(chatId, mediaInfo, defaultChannel, env);
+    // 3. /clean - 清理消息
+    if (text === "/clean") {
+      if (msg.reply_to_message) {
+        await deleteMessage(chatId, msg.reply_to_message.message_id, env);
+      }
+      await deleteMessage(chatId, msg.message_id, env);
+      return;
+    }
+
+    // 4. /random - 随机图面板
+    if (text === "/random") {
+      await sendRandomPanel(chatId, "all", env, msg.message_id);
+      return;
+    }
+
+    // 5. 文件/链接上传检测
+    // (放在命令判断之后，作为默认行为)
+    const mediaInfo = getMediaInfo(msg);
+    if (mediaInfo) {
+      if (msg.media_group_id && env.TG_KV) {
+        await handleBatchPreProcess(msg, mediaInfo, env);
+        return;
+      }
+      const channels = getChannels(env);
+      const defaultChannel = channels[0].value;
+      await sendUnifiedPanel(chatId, mediaInfo, defaultChannel, env);
+    }
+
+  } else {
+    // ————————————————
+    // 🅱️ 非私聊分支 (Channel / Group)
+    // 包含：仅限 /info
+    // ————————————————
+
+    // 1. /info - 查看元数据
+    if (text === "/info") {
+      await handleInfoCommand(msg, chatId, env, ctx);
+      return;
+    }
+
+    // 🛑 关键点：
+    // 这里没有写任何关于 getMediaInfo 或 upload 的代码。
+    // 所以，Bot 在频道里发出的图片（或用户在群里发的无关图片），
+    // 都会因为不匹配 /info 而直接结束，从而彻底根除死循环。
   }
 }
 
@@ -887,6 +935,70 @@ async function answerCallbackQuery(id, text, env) {
   });
 }
 
+// --- /info 命令处理逻辑 ---
+async function handleInfoCommand(msg, chatId, env, ctx) {
+    // 1. 确定目标消息 (回复的消息 OR 当前消息)
+    const targetMsg = msg.reply_to_message ? msg.reply_to_message : msg;
+    
+    // 2. 提取关键信息
+    const infoData = {
+        message_id: targetMsg.message_id,
+        chat_id: targetMsg.chat.id,
+        // 格式化时间
+        sent_date: new Date(targetMsg.date * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }),
+        media_info: getMediaInfo(targetMsg) // 复用现有的 helper
+    };
+
+    // 3. 构建显示文本 (JSON 格式)
+    const jsonStr = JSON.stringify(targetMsg, null, 2);
+    // 防止消息过长截断 (TG 限制 4096 字符，这里留足余量)
+    const safeJson = jsonStr.length > 3000 ? jsonStr.substring(0, 3000) + "...(truncated)" : jsonStr;
+
+    let displayText = `ℹ️ <b>消息元数据</b>\n\n`;
+    displayText += `🆔 <b>Msg ID:</b> <code>${infoData.message_id}</code>\n`;
+    displayText += `📅 <b>时间:</b> <code>${infoData.sent_date}</code>\n`;
+    
+    if (infoData.media_info) {
+        displayText += `📎 <b>File Name:</b> <code>${infoData.media_info.fileName}</code>\n`;
+        displayText += `🔑 <b>File ID:</b> <code>${infoData.media_info.fileId}</code>\n`;
+        displayText += `📂 <b>Type:</b> <code>${infoData.media_info.type}</code>\n`;
+    }
+
+    displayText += `\n📋 <b>原始 JSON:</b>\n<pre><code class="language-json">${safeJson}</code></pre>`;
+
+    // 4. 发送信息
+    const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+            chat_id: chatId, 
+            text: displayText, 
+            parse_mode: "HTML", 
+            reply_to_message_id: targetMsg.message_id 
+        })
+    });
+    const resData = await res.json();
+
+    // 5. 设置自动销毁 (如果发送成功)
+    if (resData.ok) {
+        const sentMsgId = resData.result.message_id;
+        const userCmdMsgId = msg.message_id;
+        
+        // 放入 waitUntil 确保 Worker 不会在响应后立即冻结
+        ctx.waitUntil(delayDelete(chatId, [sentMsgId, userCmdMsgId], env));
+    }
+}
+
+// --- 延迟删除辅助函数 ---
+async function delayDelete(chatId, messageIds, env) {
+    // 等待 7 秒
+    await new Promise(resolve => setTimeout(resolve, 7000));
+    
+    // 遍历删除
+    for (const msgId of messageIds) {
+        await deleteMessage(chatId, msgId, env);
+    }
+}
+
 // --- 新增辅助函数：清空 KV ---
 async function clearAllKV(env) {
     if (!env.TG_KV) return 0;
@@ -1089,4 +1201,70 @@ function buildRandomDirKeyboard(dirs, currentDir, cmdId = "") {
     // 底部返回
     keyboard.push([{ text: "🔙 返回", callback_data: `rnd:next:${currentDir}:${cmdId}` }]); 
     return keyboard;
+}
+
+// ==========================================
+// 🆕 增强版：命令配置与注册逻辑
+// ==========================================
+
+const COMMANDS_PRIVATE = [
+    { command: "list", description: "📂 浏览图床目录" },
+    { command: "random", description: "🎲 随机图面板" },
+    { command: "clean", description: "🧹 清理消息" },
+    { command: "reset", description: "🔄 重置上传缓存" },
+    { command: "init", description: "⚙️ 刷新命令菜单" }
+];
+
+const COMMANDS_PUBLIC = [
+    { command: "info", description: "ℹ️ 查看消息元数据" }
+];
+
+async function setupBotCommands(env, targetChatId = null) {
+    const url = `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/setMyCommands`;
+    const results = [];
+
+    // --- 策略：由内而外，覆盖所有可能的作用域 ---
+
+    // 1. 【私聊】 (优先级最高) -> 显示完整功能
+    // scope: all_private_chats
+    results.push(await fetch(url, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commands: COMMANDS_PRIVATE, scope: { type: "all_private_chats" } })
+    }));
+
+    // 2. 【管理员】 (关键！频道发帖者属于管理员) -> 仅显示 info
+    // scope: all_chat_administrators
+    // 这行代码是解决频道不显示的 vital key
+    results.push(await fetch(url, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commands: COMMANDS_PUBLIC, scope: { type: "all_chat_administrators" } })
+    }));
+
+    // 3. 【群组】 (普通群成员) -> 仅显示 info
+    // scope: all_group_chats
+    results.push(await fetch(url, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commands: COMMANDS_PUBLIC, scope: { type: "all_group_chats" } })
+    }));
+
+    // 4. 【默认兜底】 (频道通常落在这里) -> 仅显示 info
+    // scope: default
+    results.push(await fetch(url, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commands: COMMANDS_PUBLIC, scope: { type: "default" } })
+    }));
+
+    // 5. 【强制当前用户】 (如果有传入 chatId) -> 显示完整功能
+    // 强制刷新你自己的私聊界面
+    if (targetChatId) {
+        results.push(await fetch(url, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+                commands: COMMANDS_PRIVATE, 
+                scope: { type: "chat", chat_id: targetChatId } 
+            })
+        }));
+    }
+
+    return results.every(r => r.ok);
 }
