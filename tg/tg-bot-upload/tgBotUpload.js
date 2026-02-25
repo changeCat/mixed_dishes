@@ -27,8 +27,15 @@ function getChannels(env) {
     const raw = env.CHANNEL_LIST || "TG:telegram";
     return raw.split(",").map(item => {
         const parts = item.split(":");
-        const name = parts[0].trim();
-        const value = parts.length > 1 ? parts[1].trim() : name;
+        const name = parts[0].trim(); // 显示名称
+        const provider = parts.length > 1 ? parts[1].trim() : name; // 渠道类型 (telegram, huggingface等)
+        const subChannel = parts.length > 2 ? parts[2].trim() : null; // 扩展参数 (channelName)
+        
+        // 核心逻辑：
+        // 如果有第三个参数，我们将 value 组合为 "类型|参数" 的格式
+        // 这样 callback 传递数据时就能同时带上这两个信息，且不破坏现有的字符串传递逻辑
+        const value = subChannel ? `${provider}|${subChannel}` : provider;
+        
         return { name, value };
     });
 }
@@ -654,11 +661,30 @@ async function uploadToImageHost(fileBlob, fileName, directory, channel, env) {
   if (env.API_UPLOAD_TOKEN) uploadUrlObj.searchParams.append('authCode', env.API_UPLOAD_TOKEN); 
   if (directory) uploadUrlObj.searchParams.append('uploadFolder', directory);
   
-  // 核心：传递 channel 参数
-  uploadUrlObj.searchParams.append('uploadChannel', channel || 'telegram');
+  // --- 修改开始: 解析组合参数 ---
+  let targetProvider = channel || 'telegram';
+  let targetChannelName = null;
+
+  // 检查是否包含分隔符 '|' (这是我们在 getChannels 里组合的)
+  if (targetProvider.includes('|')) {
+      const parts = targetProvider.split('|');
+      targetProvider = parts[0];       // 例如: telegram
+      targetChannelName = parts[1];    // 例如: main
+  }
+
+  // 添加 uploadChannel 参数
+  uploadUrlObj.searchParams.append('uploadChannel', targetProvider);
+  
+  // 如果存在 channelName，则添加该参数 (对应截图中的需求)
+  if (targetChannelName) {
+      uploadUrlObj.searchParams.append('channelName', targetChannelName);
+  }
+  // --- 修改结束 ---
   
   const response = await fetch(uploadUrlObj.toString(), { method: "POST", headers: { "User-Agent": "TelegramBot/1.0" }, body: formData });
   const result = await response.json();
+  
+  // 后续原有逻辑保持不变...
   if (Array.isArray(result) && result.length > 0 && result[0].src) {
     let rawSrc = result[0].src;
     const cleanPath = (rawSrc.startsWith('/') ? rawSrc.slice(1) : rawSrc).replace(/^file\//, ''); 
@@ -990,8 +1016,8 @@ async function handleInfoCommand(msg, chatId, env, ctx) {
 
 // --- 延迟删除辅助函数 ---
 async function delayDelete(chatId, messageIds, env) {
-    // 等待 7 秒
-    await new Promise(resolve => setTimeout(resolve, 7000));
+    // 等待 12 秒
+    await new Promise(resolve => setTimeout(resolve, 12000));
     
     // 遍历删除
     for (const msgId of messageIds) {
