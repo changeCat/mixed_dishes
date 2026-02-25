@@ -25,17 +25,14 @@ export default {
 
 function getChannels(env) {
     const raw = env.CHANNEL_LIST || "TG:telegram";
-    return raw.split(",").map(item => {
-        const parts = item.split(":");
-        const name = parts[0].trim(); // 显示名称
-        const provider = parts.length > 1 ? parts[1].trim() : name; // 渠道类型 (telegram, huggingface等)
-        const subChannel = parts.length > 2 ? parts[2].trim() : null; // 扩展参数 (channelName)
+    // 过滤掉空项，并使用解构赋值精简逻辑
+    return raw.split(",").filter(Boolean).map(item => {
+        const [nameRaw, providerRaw, subChannelRaw] = item.split(":");
+        const name = nameRaw ? nameRaw.trim() : "Unknown";
+        const provider = providerRaw ? providerRaw.trim() : name;
+        const subChannel = subChannelRaw ? subChannelRaw.trim() : null;
         
-        // 核心逻辑：
-        // 如果有第三个参数，我们将 value 组合为 "类型|参数" 的格式
-        // 这样 callback 传递数据时就能同时带上这两个信息，且不破坏现有的字符串传递逻辑
         const value = subChannel ? `${provider}|${subChannel}` : provider;
-        
         return { name, value };
     });
 }
@@ -338,8 +335,12 @@ async function handleCallback(query, env) {
       let resultText = `✅ <b>批量上传完成</b>\n📂 <b>目录:</b> ${targetDir}\n📡 <b>渠道:</b> ${channelCode}\n━━━━━━━━━━━━━━━\n`;
       
       const uploadPromises = listResult.keys.map(async (key) => {
-          const mInfo = JSON.parse(await env.TG_KV.get(key.name));
+          let mInfo = { fileName: "未知文件" };
           try {
+              const rawData = await env.TG_KV.get(key.name);
+              if (!rawData) throw new Error("缓存数据已过期");
+              mInfo = JSON.parse(rawData);
+              
               const res = await processUploadInternal(mInfo, targetDir, channelCode, env);
               return { ok: res.success, name: mInfo.fileName, url: res.accessUrl, error: res.error };
           } catch(e) { 
@@ -621,11 +622,15 @@ async function processUploadInternal(mediaInfo, targetDir, channelCode, env) {
     } else {
         // B. 如果是 Telegram 原生文件
         const fileLinkRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/getFile?file_id=${mediaInfo.fileId}`);
+        if (!fileLinkRes.ok) throw new Error(`获取文件信息接口异常 (${fileLinkRes.status})`);
+        
         const fileLinkData = await fileLinkRes.json();
-        if (!fileLinkData.ok) throw new Error("获取 TG 文件链接失败");
+        if (!fileLinkData.ok) throw new Error(fileLinkData.description || "获取 TG 文件链接失败");
+        
         const downloadUrl = `https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${fileLinkData.result.file_path}`;
         const fileRes = await fetch(downloadUrl);
-        if (!fileRes.ok) throw new Error("下载 TG 文件失败");
+        if (!fileRes.ok) throw new Error(`下载 TG 文件失败 (${fileRes.status})`);
+        
         const originalBlob = await fileRes.blob();
         
         // 修正 mime 类型
@@ -711,12 +716,9 @@ function getMediaInfo(msg) {
     fileId = msg.photo[msg.photo.length - 1].file_id;
     baseName += ".jpg";
     type = "photo";
-  } else if (msg.video) {
-    fileId = msg.video.file_id;
-    type = "video";
-    baseName += ".mp4";
-  } else if (msg.animation) {
-    fileId = msg.animation.file_id;
+  } else if (msg.video || msg.animation) {
+    const media = msg.video || msg.animation;
+    fileId = media.file_id;
     type = "video";
     baseName += ".mp4";
   } else if (msg.document) {
@@ -1118,13 +1120,9 @@ async function renderRandomImage(chatId, messageId, dir, env, isEditMedia, userC
         }
 
         // --- 核心修复1：精准识别文件后缀 ---
-        let ext = "";
-        try {
-            const urlObj = new URL(finalUrl);
-            ext = urlObj.pathname.split('.').pop().toLowerCase();
-        } catch (e) {
-            ext = finalUrl.split('.').pop().toLowerCase();
-        }
+        // 过滤掉 URL 中的参数(?)和哈希(#)，安全提取后缀
+        const cleanUrl = finalUrl.split('?')[0].split('#')[0];
+        const ext = cleanUrl.split('.').pop().toLowerCase();
 
         const isVideo = ['mp4', 'webm', 'mov', 'mkv', 'gif', 'avi', 'm4v', 'flv'].includes(ext);
         const mediaType = isVideo ? 'video' : 'photo';
