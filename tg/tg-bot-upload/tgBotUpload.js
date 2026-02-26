@@ -128,15 +128,6 @@ async function handleUpdate(update, env, ctx) {
       return;
     }
 
-    // 3. /clean - 清理消息
-    if (text === "/clean") {
-      if (msg.reply_to_message) {
-        await deleteMessage(chatId, msg.reply_to_message.message_id, env);
-      }
-      await deleteMessage(chatId, msg.message_id, env);
-      return;
-    }
-
     // 4. /random - 随机图面板
     if (text === "/random") {
       await sendRandomPanel(chatId, "all", env, msg.message_id);
@@ -302,30 +293,30 @@ async function handleCallback(query, env) {
   if (data.startsWith("batch_upload:")) {
       const parts = data.split(":");
       const targetDir = parts[1];
-      const channelCode = parts[2]; // 从 callback 直接获取当前选中的 channel
+      const channelCode = parts[2];
 
       const mapKey = `map:${chatId}:${messageId}`;
       const groupId = await env.TG_KV.get(mapKey);
       
       if (!groupId) return answerCallbackQuery(query.id, "任务过期", env);
       
-      await answerCallbackQuery(query.id, "开始上传...", env);
-      
-      // 更新状态
+      // 【优化点】：立即修改界面为加载状态，并清空所有按钮防止重复点击
       await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
               chat_id: chatId, message_id: messageId,
-              text: `⏳ 正在批量上传至 [${targetDir}]\n📡 渠道: ${channelCode}...`, 
-              parse_mode: "HTML" 
+              text: `⏳ <b>正在发起批量上传...</b>\n📂 目录: <code>${targetDir}</code>\n📡 渠道: <code>${channelCode}</code>\n\n请稍后，正在处理队列...`, 
+              parse_mode: "HTML",
+              reply_markup: { inline_keyboard: [[{ text: "⏳ 正在上传中，请稍后...", callback_data: "ignore" }]] }
           })
       });
+      await answerCallbackQuery(query.id, "上传任务已启动", env);
 
       const listResult = await env.TG_KV.list({ prefix: `batch:${groupId}:file:` });
       if (listResult.keys.length === 0) {
           await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`, {
               method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ chat_id: chatId, message_id: messageId, text: "❌ 未找到文件", parse_mode: "HTML" })
+              body: JSON.stringify({ chat_id: chatId, message_id: messageId, text: "❌ 未找到文件或任务已过期", parse_mode: "HTML" })
           });
           return;
       }
@@ -340,7 +331,6 @@ async function handleCallback(query, env) {
               const rawData = await env.TG_KV.get(key.name);
               if (!rawData) throw new Error("缓存数据已过期");
               mInfo = JSON.parse(rawData);
-              
               const res = await processUploadInternal(mInfo, targetDir, channelCode, env);
               return { ok: res.success, name: mInfo.fileName, url: res.accessUrl, error: res.error };
           } catch(e) { 
@@ -375,9 +365,19 @@ async function handleCallback(query, env) {
   if (data.startsWith("upload:")) {
     const parts = data.split(":");
     const targetDir = parts[1];
-    const channelCode = parts[2]; // 从 callback 获取
+    const channelCode = parts[2];
 
-    await answerCallbackQuery(query.id, "正在请求上传...", env);
+    // 【优化点】：立即响应并修改界面，移除按钮防止二次触发
+    await answerCallbackQuery(query.id, "🚀 开始上传...", env);
+    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            chat_id: chatId, message_id: messageId,
+            caption: `⏳ <b>正在上传至 [${targetDir}]</b>\n📡 渠道: <code>${channelCode}</code>\n\n请稍候，正在传输数据...`,
+            parse_mode: "HTML",
+            reply_markup: { inline_keyboard: [] } // 立即清空按钮
+        })
+    });
     
     let mediaInfo = getMediaInfo(query.message);
     if (!mediaInfo && query.message.reply_to_message) {
@@ -385,11 +385,10 @@ async function handleCallback(query, env) {
     }
     
     if (mediaInfo) {
-      await editMessageCaption(chatId, messageId, `⏳ 正在上传至 [${targetDir}]\n📡 渠道: ${channelCode}...`, env);
+      // 执行真正的上传逻辑 (里面会再次更新 caption 为成功或失败)
       await processUpload(chatId, mediaInfo, targetDir, channelCode, env, messageId);
     } else {
-      await sendTelegramMessage(chatId, "❌ 文件信息过期", env);
-      await deleteMessage(chatId, messageId, env);
+      await editMessageCaption(chatId, messageId, "❌ 文件信息过期，请重新发送文件", env);
     }
     return;
   }
@@ -1234,7 +1233,6 @@ function buildRandomDirKeyboard(dirs, currentDir, cmdId = "") {
 const COMMANDS_PRIVATE = [
     { command: "list", description: "📂 浏览图床目录" },
     { command: "random", description: "🎲 随机图面板" },
-    { command: "clean", description: "🧹 清理消息" },
     { command: "reset", description: "🔄 重置上传缓存" },
     { command: "init", description: "⚙️ 刷新命令菜单" }
 ];
