@@ -1166,30 +1166,51 @@ async function deleteFromImageHost(path, env) {
   
   try {
     const uploadUrl = new URL(env.API_UPLOAD_URL);
-    // 直接拼接路径。注意：path 已经是类似 "default/123.jpg" 的格式
-    const finalUrl = `${uploadUrl.origin}/api/manage/delete/${path}`;
     
+    // 【核心修复】：精细化路径处理
+    // 很多 API 路由不支持编码后的斜杠 (%2F)，但文件名里的特殊字符必须编码
+    const pathParts = path.split('/');
+    const safePath = pathParts.map(part => encodeURIComponent(part)).join('/');
+    
+    const finalUrl = `${uploadUrl.origin}/api/manage/delete/${safePath}`;
+    
+    // 设置一个较短的超时，防止 Worker 挂起
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+
     const response = await fetch(finalUrl, {
       method: "GET",
       headers: {
         "Authorization": `Bearer ${env.API_DELETE_TOKEN}`,
-        "User-Agent": "TelegramBot/1.0"
-      }
+        "User-Agent": "TelegramBot/1.0",
+        "Accept": "application/json"
+      },
+      signal: controller.signal
     });
+    clearTimeout(timeoutId);
 
-    const resJson = await response.json();
+    const resJson = await response.json().catch(() => ({}));
     
-    // 适配常见的 API 返回格式
-    if (response.ok && (resJson.success === true || resJson.code === 200 || resJson.status === "success")) {
+    // 【核心修复】：多维度判断删除结果
+    // 兼容 success, code=200, status="success" 等各种图床 API 返回格式
+    const isSuccess = response.ok && (
+      resJson.success === true || 
+      resJson.code === 200 || 
+      resJson.status === "success" ||
+      resJson.message?.includes("success")
+    );
+
+    if (isSuccess) {
       return { success: true };
     } else {
-      return { 
-        success: false, 
-        error: resJson.message || resJson.error || `HTTP ${response.status}` 
-      };
+      // 提取尽可能详细的错误信息
+      const errMsg = resJson.message || resJson.error || resJson.detail || `HTTP ${response.status}`;
+      return { success: false, error: errMsg };
     }
   } catch (e) {
-    return { success: false, error: `网络请求异常: ${e.message}` };
+    let errorDesc = e.message;
+    if (e.name === 'AbortError') errorDesc = "API 请求超时";
+    return { success: false, error: `网络异常: ${errorDesc}` };
   }
 }
 
