@@ -62,11 +62,11 @@ async function handleUpdate(update, env, ctx) {
   } else if (update.channel_post) {
     msg = update.channel_post;
     chatId = msg.chat.id;
-    userId = chatId; // 频道没有具体用户，用频道ID鉴权
+    userId = chatId; 
     chatType = "channel";
   } else if (update.callback_query) {
-    // 按钮回调优先处理，因为它是交互操作，不属于“命令/消息”分类
-    await handleCallback(update.callback_query, env);
+    // 🚩 关键修复点：这里必须传入 ctx 参数
+    await handleCallback(update.callback_query, env, ctx); 
     return;
   } else {
     return; // 未知更新类型，忽略
@@ -159,6 +159,24 @@ async function handleUpdate(update, env, ctx) {
       return;
     }
 
+    // 2. /delete - 删除图床文件 (仅限回复消息)
+    if (text === "/delete") {
+      if (!msg.reply_to_message) {
+          const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: chatId, text: "❌ 请回复一张要删除的图片消息", reply_to_message_id: msg.message_id })
+          });
+          const resData = await res.json();
+          if (resData.ok) {
+              // 12秒后删除：用户指令 + 机器人报错提示
+              ctx.waitUntil(delayDelete(chatId, [msg.message_id, resData.result.message_id], env));
+          }
+          return;
+      }
+      await handleDeleteCommand(msg, chatId, env, ctx);
+      return;
+    }
+
     // 🛑 关键点：
     // 这里没有写任何关于 getMediaInfo 或 upload 的代码。
     // 所以，Bot 在频道里发出的图片（或用户在群里发的无关图片），
@@ -203,7 +221,7 @@ async function handleBatchPreProcess(msg, mediaInfo, env) {
 // ----------------------------------------------------------------
 // ⚠️ 核心交互逻辑：handleCallback
 // ----------------------------------------------------------------
-async function handleCallback(query, env) {
+async function handleCallback(query, env, ctx) { 
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
   const data = query.data; 
@@ -504,6 +522,63 @@ async function handleCallback(query, env) {
     const dirs = getDirs(env);
     await editToDirectoryBrowser(chatId, messageId, dirs, env, cmdId);
     return;
+  }
+
+  // --- 删除二次确认回调处理 ---
+  if (data.startsWith("confirm_del:")) {
+      const [_, action, targetMsgId] = data.split(":");
+      const tempKey = `del_task:${chatId}:${targetMsgId}`;
+
+      // A. 取消操作
+      if (action === "no") {
+          await answerCallbackQuery(query.id, "已取消", env);
+          const taskData = env.TG_KV ? await env.TG_KV.get(tempKey) : null;
+          if (taskData) {
+              const { cmdId } = JSON.parse(taskData);
+              // 立即删除确认面板，清理用户指令
+              await deleteMessage(chatId, messageId, env);
+              await deleteMessage(chatId, cmdId, env);
+              await env.TG_KV.delete(tempKey);
+          } else {
+              await deleteMessage(chatId, messageId, env);
+          }
+          return;
+      }
+
+      // B. 确认删除分支内部
+      if (action === "yes") {
+          await answerCallbackQuery(query.id, "执行图床删除中...", env);
+          const taskData = env.TG_KV ? await env.TG_KV.get(tempKey) : null;
+          
+          if (!taskData) {
+              await editMessageText(chatId, messageId, "❌ 任务过期，请重新发起 /delete", env);
+              ctx.waitUntil(delayDelete(chatId, [messageId], env));
+              return;
+          }
+
+          const { path, cmdId } = JSON.parse(taskData);
+          const deleteResult = await deleteFromImageHost(path, env);
+
+          if (deleteResult.success) {
+              // 1. 物理删除成功后，立即撤回频道原图 (targetMsgId)
+              await deleteMessage(chatId, targetMsgId, env);
+              
+              // 2. 更新提示面板文字
+              await editMessageText(chatId, messageId, `✅ <b>图床删除成功</b>\n\n文件已从存储中移除。\n\n相关提示将在 12 秒内自动清理。`, env);
+              
+              // 3. 【完全复用 /info 逻辑】
+              // 传入命令消息 ID (cmdId) 和 面板消息 ID (messageId)
+              ctx.waitUntil(delayDelete(chatId, [cmdId, messageId], env));
+              
+              // 4. 清理临时 KV (这个操作很快，直接执行即可)
+              await env.TG_KV.delete(tempKey);
+          } else {
+              // 删除失败：保留原图，仅报错
+              await editMessageText(chatId, messageId, `❌ <b>删除失败</b>\n原因: <code>${deleteResult.error}</code>`, env);
+              ctx.waitUntil(delayDelete(chatId, [messageId], env)); 
+          }
+      }
+      return;
   }
 }
 
@@ -1015,14 +1090,127 @@ async function handleInfoCommand(msg, chatId, env, ctx) {
     }
 }
 
+// --- /delete 命令处理逻辑 (二次确认 + 路径显示版) ---
+async function handleDeleteCommand(msg, chatId, env, ctx) {
+    const targetMsg = msg.reply_to_message;
+    const mediaInfo = getMediaInfo(targetMsg);
+    const tgFileId = mediaInfo?.fileId;
+
+    // 发送查找状态
+    const feedback = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text: "🔍 正在匹配图床索引...", reply_to_message_id: msg.message_id })
+    }).then(r => r.json());
+
+    if (!feedback.ok) return;
+    const feedbackId = feedback.result.message_id;
+
+    try {
+        // 1. 读取 img_url (只读)
+        if (!env.img_url) throw new Error("未绑定 img_url KV");
+        const rawData = await env.img_url.get("manage@index_0");
+        const indexArray = rawData ? JSON.parse(rawData) : [];
+        
+        const matches = indexArray.filter(item => {
+            const topId = item.TgFileId || item.fileId;
+            const metaId = item.metadata ? (item.metadata.TgFileId || item.metadata.fileId) : null;
+            return topId === tgFileId || metaId === tgFileId;
+        });
+
+        if (matches.length === 0) {
+            await editMessageText(chatId, feedbackId, "❌ 匹配失败：图床索引中不存在此文件。", env);
+            ctx.waitUntil(delayDelete(chatId, [msg.message_id, feedbackId], env));
+            return;
+        }
+
+        const targetData = matches[0];
+        // --- 核心修改：直接使用 id，不再进行复杂的字符串替换 ---
+        const deletePath = targetData.id; 
+        const fileName = (targetData.metadata && targetData.metadata.FileName) || "未知文件名";
+
+        // 存入 TG_KV (临时任务缓存)
+        if (env.TG_KV) {
+            const tempKey = `del_task:${chatId}:${targetMsg.message_id}`;
+            await env.TG_KV.put(tempKey, JSON.stringify({
+                path: deletePath,
+                cmdId: msg.message_id
+            }), { expirationTtl: 600 });
+        }
+
+        // 修改确认面板的文字显示
+        const keyboard = {
+            inline_keyboard: [[
+                { text: "✅ 确认删除", callback_data: `confirm_del:yes:${targetMsg.message_id}` },
+                { text: "❌ 取消操作", callback_data: `confirm_del:no:${targetMsg.message_id}` }
+            ]]
+        };
+
+        const confirmText = `⚠️ <b>确认从图床删除？</b>\n\n🆔 <b>文件路径 (ID):</b>\n<code>${deletePath}</code>\n\n📄 <b>原始名称:</b> <code>${fileName}</code>\n\n确认后将物理删除文件并撤回此消息。`;
+        
+        await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                chat_id: chatId, message_id: feedbackId,
+                text: confirmText, parse_mode: "HTML", reply_markup: keyboard
+            })
+        });
+
+    } catch (e) {
+        await editMessageText(chatId, feedbackId, `❌ 处理出错: ${e.message}`, env);
+        ctx.waitUntil(delayDelete(chatId, [msg.message_id, feedbackId], env));
+    }
+}
+
+async function deleteFromImageHost(path, env) {
+  if (!env.API_DELETE_TOKEN) return { success: false, error: "未配置 API_DELETE_TOKEN" };
+  
+  try {
+    const uploadUrl = new URL(env.API_UPLOAD_URL);
+    // 直接拼接路径。注意：path 已经是类似 "default/123.jpg" 的格式
+    const finalUrl = `${uploadUrl.origin}/api/manage/delete/${path}`;
+    
+    const response = await fetch(finalUrl, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${env.API_DELETE_TOKEN}`,
+        "User-Agent": "TelegramBot/1.0"
+      }
+    });
+
+    const resJson = await response.json();
+    
+    // 适配常见的 API 返回格式
+    if (response.ok && (resJson.success === true || resJson.code === 200 || resJson.status === "success")) {
+      return { success: true };
+    } else {
+      return { 
+        success: false, 
+        error: resJson.message || resJson.error || `HTTP ${response.status}` 
+      };
+    }
+  } catch (e) {
+    return { success: false, error: `网络请求异常: ${e.message}` };
+  }
+}
+
+// 辅助函数：编辑消息文本
+async function editMessageText(chatId, messageId, text, env) {
+    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId, text: text, parse_mode: "HTML" })
+    });
+}
+
 // --- 延迟删除辅助函数 ---
 async function delayDelete(chatId, messageIds, env) {
-    // 等待 12 秒
-    await new Promise(resolve => setTimeout(resolve, 12000));
-    
-    // 遍历删除
+    // 🚩 建议从 12000 改为 5000 (5秒) 或 7000 (7秒)，提高成功率
+    await new Promise(resolve => setTimeout(resolve, 7000)); 
     for (const msgId of messageIds) {
-        await deleteMessage(chatId, msgId, env);
+        try { 
+            await deleteMessage(chatId, msgId, env); 
+        } catch(e) {
+            // 忽略由于消息已被手动删除导致的错误
+        }
     }
 }
 
@@ -1238,7 +1426,8 @@ const COMMANDS_PRIVATE = [
 ];
 
 const COMMANDS_PUBLIC = [
-    { command: "info", description: "ℹ️ 查看消息元数据" }
+    { command: "info", description: "ℹ️ 查看消息元数据" },
+    { command: "delete", description: "🗑 删除文件" }
 ];
 
 async function setupBotCommands(env, targetChatId = null) {
