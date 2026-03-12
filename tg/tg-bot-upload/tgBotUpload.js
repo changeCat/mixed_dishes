@@ -23,6 +23,10 @@ export default {
 
 // --- 配置辅助函数 ---
 
+// 新增：内存级全局防抖锁与无 KV 临时缓存
+const groupLocks = new Map();
+const noKvCache = new Map();
+
 function getChannels(env) {
     const raw = env.CHANNEL_LIST || "TG:telegram";
     // 过滤掉空项，并使用解构赋值精简逻辑
@@ -138,10 +142,18 @@ async function handleUpdate(update, env, ctx) {
     // (放在命令判断之后，作为默认行为)
     const mediaInfo = getMediaInfo(msg);
     if (mediaInfo) {
-      if (msg.media_group_id && env.TG_KV) {
-        await handleBatchPreProcess(msg, mediaInfo, env);
-        return;
+      if (msg.media_group_id) {
+        if (env.TG_KV) {
+          // 有 KV 数据库：走正规合集上传
+          await handleBatchPreProcess(msg, mediaInfo, env);
+          return;
+        } else {
+          // ⚠️ 无 KV 数据库：走临时缓存询问流程 (必须用 waitUntil 防止 Worker 挂起)
+          ctx.waitUntil(handleNoKvBatch(msg, mediaInfo, env));
+          return;
+        }
       }
+      
       const channels = getChannels(env);
       const defaultChannel = channels[0].value;
       await sendUnifiedPanel(chatId, mediaInfo, defaultChannel, env);
@@ -186,28 +198,57 @@ async function handleUpdate(update, env, ctx) {
 
 // --- 批量逻辑 (KV 依赖) ---
 async function handleBatchPreProcess(msg, mediaInfo, env) {
-    const groupId = msg.media_group_id;
+const groupId = msg.media_group_id;
     const chatId = msg.chat.id;
     const fileKey = `batch:${groupId}:file:${mediaInfo.fileId}`;
+    
+    // 1. 将当前图片存入 KV
     await env.TG_KV.put(fileKey, JSON.stringify(mediaInfo), { expirationTtl: 3600 });
 
-    const randomDelay = Math.floor(Math.random() * 750) + 50;
-    await new Promise(resolve => setTimeout(resolve, randomDelay));
+    // 2. 内存级防抖锁 (增加防内存泄露设计)
+    const now = Date.now();
+    if (groupLocks.has(groupId)) {
+        if (now - groupLocks.get(groupId) < 60000) {
+            return; // 60秒内已有请求在处理该组图片，直接拦截
+        } else {
+            // 超过60秒的过期锁，顺手清理掉
+            groupLocks.delete(groupId); 
+        }
+    }
+    
+    // 抢占锁
+    groupLocks.set(groupId, now);
 
+    // 【优化点】：设置一个定时器，60秒后自动释放内存中的这个锁
+    setTimeout(() => {
+        groupLocks.delete(groupId);
+    }, 60000);
+
+    // 3. 延迟等待：给同组的其他图片 1.5 秒的时间存入 KV
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    // 4. KV 级防抖兜底
     const panelKey = `batch:${groupId}:panel`;
     const hasPanel = await env.TG_KV.get(panelKey);
 
     if (!hasPanel) {
         await env.TG_KV.put(panelKey, "pending", { expirationTtl: 3600 });
+        
         // 初始询问模式
-        const keyboard = [
+        const keyboard =[
             [{ text: "📦 统一上传 (推荐)", callback_data: `mode:unify` }],
             [{ text: "📑 分别上传 (繁琐)", callback_data: `mode:separate` }],
             [{ text: "❌ 取消", callback_data: "batch_cancel" }]
         ];
         const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: chatId, text: "📚 **收到一组文件**\n请选择处理方式：", parse_mode: "Markdown", reply_markup: { inline_keyboard: keyboard }, reply_to_message_id: msg.message_id })
+            body: JSON.stringify({ 
+                chat_id: chatId, 
+                text: "📚 **收到一组文件**\n请选择处理方式：", 
+                parse_mode: "Markdown", 
+                reply_markup: { inline_keyboard: keyboard }, 
+                reply_to_message_id: msg.message_id 
+            })
         });
         const resJson = await res.json();
         if (resJson.ok) {
@@ -217,6 +258,51 @@ async function handleBatchPreProcess(msg, mediaInfo, env) {
     }
 }
 
+// --- 无 KV 批量兜底逻辑 ---
+async function handleNoKvBatch(msg, mediaInfo, env) {
+    const groupId = msg.media_group_id;
+    const chatId = msg.chat.id;
+
+    // 1. 将该图片的信息存入基于内存的临时缓存中
+    if (!noKvCache.has(groupId)) {
+        noKvCache.set(groupId,[]);
+    }
+    noKvCache.get(groupId).push({ msg, mediaInfo });
+
+    // 2. 防抖拦截：后续并发请求在这里停止，只有第一个请求会往下走
+    const now = Date.now();
+    if (groupLocks.has(groupId) && (now - groupLocks.get(groupId) < 60000)) {
+        return; 
+    }
+    groupLocks.set(groupId, now);
+
+    // 3. 黄金等待期：等 1.5 秒，让属于同一组的其他图片全部到达并进入内存缓存
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    const cache = noKvCache.get(groupId) ||[];
+    const count = cache.length;
+
+    // 4. 发出交互面板
+    const keyboard = [[{ text: `📑 分别单独上传 (${count}个文件)`, callback_data: `nokv_sep:${groupId}` }],[{ text: "❌ 取消本次上传", callback_data: `nokv_cancel:${groupId}` }]
+    ];
+
+    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+            chat_id: chatId, 
+            text: `⚠️ **未配置 TG_KV 数据库**\n\n检测到您发送了一组包含 **${count}** 个文件的相册。\n由于未绑定 \`TG_KV\`，机器人无法合并它们。\n\n请选择后续操作：`, 
+            parse_mode: "Markdown", 
+            reply_markup: { inline_keyboard: keyboard },
+            reply_to_message_id: msg.message_id
+        })
+    });
+
+    // 5. 设置 10 分钟后自动清理内存，防止内存泄露
+    setTimeout(() => {
+        noKvCache.delete(groupId);
+        groupLocks.delete(groupId);
+    }, 10 * 60 * 1000);
+}
 
 // ----------------------------------------------------------------
 // ⚠️ 核心交互逻辑：handleCallback
@@ -415,6 +501,60 @@ async function handleCallback(query, env, ctx) {
   if (data === "upload_cancel" || data === "batch_cancel") {
       await answerCallbackQuery(query.id, "已取消", env);
       await deleteMessage(chatId, messageId, env);
+      return;
+  }
+
+  // --- 无 KV 模式临时缓存交互 ---
+  if (data.startsWith("nokv_sep:")) {
+      const groupId = data.split(":")[1];
+      const cache = noKvCache.get(groupId);
+
+      // 如果用户过了一天再点，或者请求漂移到了其他节点导致缓存丢失
+      if (!cache || cache.length === 0) {
+          await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                  chat_id: chatId, message_id: messageId,
+                  text: "❌ **临时缓存已过期**\n\n请重新发送文件，或者前往 Cloudflare 绑定 `TG_KV` 数据库以彻底解决此问题。",
+                  parse_mode: "Markdown"
+              })
+          });
+          await answerCallbackQuery(query.id, "缓存已过期", env);
+          return;
+      }
+
+      // 修改原提示语为进行中的状态
+      await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+              chat_id: chatId, message_id: messageId,
+              text: `✅ **正在为您展开 ${cache.length} 个独立的上传面板...**\n\n💡 提示：强烈建议绑定 \`TG_KV\` 开启无感合并体验！`,
+              parse_mode: "Markdown"
+          })
+      });
+
+      const channels = getChannels(env);
+      const defaultChannel = channels[0].value;
+
+      // 循环读取内存缓存，为每一张图片弹出上传面板
+      for (const item of cache) {
+          await sendUnifiedPanel(chatId, item.mediaInfo, defaultChannel, env);
+          await new Promise(resolve => setTimeout(resolve, 150)); // 微小延迟，防止触发 TG 的防刷屏限制
+      }
+
+      // 用完即删，释放内存
+      noKvCache.delete(groupId);
+      groupLocks.delete(groupId);
+      await answerCallbackQuery(query.id, "面板已展开", env);
+      return;
+  }
+
+  if (data.startsWith("nokv_cancel:")) {
+      const groupId = data.split(":")[1];
+      noKvCache.delete(groupId);
+      groupLocks.delete(groupId);
+      await deleteMessage(chatId, messageId, env);
+      await answerCallbackQuery(query.id, "已取消操作", env);
       return;
   }
 
