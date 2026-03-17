@@ -196,108 +196,135 @@ async function handleUpdate(update, env, ctx) {
   }
 }
 
-// --- 批量逻辑 (KV 依赖) ---
+// --- 批量逻辑 (KV 依赖)[极致秒回优化版] ---
 async function handleBatchPreProcess(msg, mediaInfo, env) {
-const groupId = msg.media_group_id;
+    const groupId = msg.media_group_id;
     const chatId = msg.chat.id;
     const fileKey = `batch:${groupId}:file:${mediaInfo.fileId}`;
     
     // 1. 将当前图片存入 KV
     await env.TG_KV.put(fileKey, JSON.stringify(mediaInfo), { expirationTtl: 3600 });
 
-    // 2. 内存级防抖锁 (增加防内存泄露设计)
+    // 2. 内存级防抖锁
     const now = Date.now();
     if (groupLocks.has(groupId)) {
         if (now - groupLocks.get(groupId) < 60000) {
-            return; // 60秒内已有请求在处理该组图片，直接拦截
+            return; // 拦截属于同一个相册的后续并发请求
         } else {
-            // 超过60秒的过期锁，顺手清理掉
             groupLocks.delete(groupId); 
         }
     }
-    
-    // 抢占锁
     groupLocks.set(groupId, now);
+    setTimeout(() => groupLocks.delete(groupId), 60000);
 
-    // 【优化点】：设置一个定时器，60秒后自动释放内存中的这个锁
-    setTimeout(() => {
-        groupLocks.delete(groupId);
-    }, 60000);
+    // 🟢 优化点 1：瞬间响应！立即给用户发出“加载中”的提示，彻底消除 1 秒的等待感
+    const pendingRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+            chat_id: chatId, 
+            text: "⏳ **正在接收并合并相册，请稍候...**", 
+            parse_mode: "Markdown", 
+            reply_to_message_id: msg.message_id 
+        })
+    });
+    const pendingJson = await pendingRes.json();
+    const pendingMsgId = pendingJson.ok ? pendingJson.result.message_id : null;
 
-    // 3. 延迟等待：给同组的其他图片 1.5 秒的时间存入 KV
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    // 🟢 优化点 2：将原先 1.5 秒 (1500ms) 的死等缩短为 800ms
+    await new Promise(resolve => setTimeout(resolve, 800));
 
-    // 4. KV 级防抖兜底
+    // 4. KV 级防抖兜底与面板渲染
     const panelKey = `batch:${groupId}:panel`;
     const hasPanel = await env.TG_KV.get(panelKey);
 
     if (!hasPanel) {
         await env.TG_KV.put(panelKey, "pending", { expirationTtl: 3600 });
         
-        // 初始询问模式
-        const keyboard =[
-            [{ text: "📦 统一上传 (推荐)", callback_data: `mode:unify` }],
-            [{ text: "📑 分别上传 (繁琐)", callback_data: `mode:separate` }],
-            [{ text: "❌ 取消", callback_data: "batch_cancel" }]
+        const keyboard =[[{ text: "📦 统一上传 (推荐)", callback_data: `mode:unify` }],[{ text: "📑 分别上传 (繁琐)", callback_data: `mode:separate` }],[{ text: "❌ 取消", callback_data: "batch_cancel" }]
         ];
-        const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-                chat_id: chatId, 
-                text: "📚 **收到一组文件**\n请选择处理方式：", 
-                parse_mode: "Markdown", 
-                reply_markup: { inline_keyboard: keyboard }, 
-                reply_to_message_id: msg.message_id 
-            })
-        });
-        const resJson = await res.json();
-        if (resJson.ok) {
-            const mapKey = `map:${chatId}:${resJson.result.message_id}`;
+        
+        // 🟢 优化点 3：无缝 Edit 刚才的提示框，替换为真实的交互面板
+        if (pendingMsgId) {
+            await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ 
+                    chat_id: chatId, 
+                    message_id: pendingMsgId,
+                    text: "📚 **收到一组文件**\n请选择处理方式：", 
+                    parse_mode: "Markdown", 
+                    reply_markup: { inline_keyboard: keyboard } 
+                })
+            });
+            const mapKey = `map:${chatId}:${pendingMsgId}`;
             await env.TG_KV.put(mapKey, groupId, { expirationTtl: 3600 });
+        } else {
+            // 兜底正常发送逻辑
+            const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chat_id: chatId, text: "📚 **收到一组文件**\n请选择处理方式：", parse_mode: "Markdown", reply_markup: { inline_keyboard: keyboard }, reply_to_message_id: msg.message_id })
+            });
+            const resJson = await res.json();
+            if (resJson.ok) await env.TG_KV.put(`map:${chatId}:${resJson.result.message_id}`, groupId, { expirationTtl: 3600 });
         }
+    } else if (pendingMsgId) {
+        // 如果已经被其它极端并发抢发了面板，自动删掉多余的“加载中”消息
+        await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId })
+        });
     }
 }
 
-// --- 无 KV 批量兜底逻辑 ---
+// --- 无 KV 批量兜底逻辑 [极致秒回优化版] ---
 async function handleNoKvBatch(msg, mediaInfo, env) {
     const groupId = msg.media_group_id;
     const chatId = msg.chat.id;
 
-    // 1. 将该图片的信息存入基于内存的临时缓存中
-    if (!noKvCache.has(groupId)) {
-        noKvCache.set(groupId,[]);
-    }
+    if (!noKvCache.has(groupId)) noKvCache.set(groupId,[]);
     noKvCache.get(groupId).push({ msg, mediaInfo });
 
-    // 2. 防抖拦截：后续并发请求在这里停止，只有第一个请求会往下走
     const now = Date.now();
-    if (groupLocks.has(groupId) && (now - groupLocks.get(groupId) < 60000)) {
-        return; 
-    }
+    if (groupLocks.has(groupId) && (now - groupLocks.get(groupId) < 60000)) return; 
     groupLocks.set(groupId, now);
 
-    // 3. 黄金等待期：等 1.5 秒，让属于同一组的其他图片全部到达并进入内存缓存
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    // 🟢 瞬间反馈
+    const pendingRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+            chat_id: chatId, text: "⏳ **正在缓冲相册队列 (无 KV 模式)...**", parse_mode: "Markdown", reply_to_message_id: msg.message_id
+        })
+    });
+    const pendingJson = await pendingRes.json();
+    const pendingMsgId = pendingJson.ok ? pendingJson.result.message_id : null;
+
+    // 🟢 缩短死等时间至 600 毫秒
+    await new Promise(resolve => setTimeout(resolve, 600));
 
     const cache = noKvCache.get(groupId) ||[];
     const count = cache.length;
 
-    // 4. 发出交互面板
-    const keyboard = [[{ text: `📑 分别单独上传 (${count}个文件)`, callback_data: `nokv_sep:${groupId}` }],[{ text: "❌ 取消本次上传", callback_data: `nokv_cancel:${groupId}` }]
-    ];
+    const keyboard = [[{ text: `📑 分别单独上传 (${count}个文件)`, callback_data: `nokv_sep:${groupId}` }],[{ text: "❌ 取消本次上传", callback_data: `nokv_cancel:${groupId}` }]];
+    
+    const finalMsgData = {
+        chat_id: chatId, 
+        text: `⚠️ **未配置 TG_KV 数据库**\n\n检测到您发送了一组包含 **${count}** 个文件的相册。\n由于未绑定 \`TG_KV\`，机器人无法合并它们。\n\n请选择后续操作：`, 
+        parse_mode: "Markdown", 
+        reply_markup: { inline_keyboard: keyboard }
+    };
 
-    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-            chat_id: chatId, 
-            text: `⚠️ **未配置 TG_KV 数据库**\n\n检测到您发送了一组包含 **${count}** 个文件的相册。\n由于未绑定 \`TG_KV\`，机器人无法合并它们。\n\n请选择后续操作：`, 
-            parse_mode: "Markdown", 
-            reply_markup: { inline_keyboard: keyboard },
-            reply_to_message_id: msg.message_id
-        })
-    });
+    // 🟢 无缝替换面板
+    if (pendingMsgId) {
+        finalMsgData.message_id = pendingMsgId;
+        await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(finalMsgData)
+        });
+    } else {
+        finalMsgData.reply_to_message_id = msg.message_id;
+        await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(finalMsgData)
+        });
+    }
 
-    // 5. 设置 10 分钟后自动清理内存，防止内存泄露
     setTimeout(() => {
         noKvCache.delete(groupId);
         groupLocks.delete(groupId);
