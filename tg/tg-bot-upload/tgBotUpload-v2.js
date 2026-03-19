@@ -29,6 +29,7 @@ export default {
 // ⚙️ 常量与内存态缓存
 // ==========================================
 
+// 统一维护各类超时、分页、并发、按钮布局等基础配置。
 const CONST = {
   GROUP_LOCK_TTL_MS: 60 * 1000,
   NO_KV_CACHE_TTL_MS: 10 * 60 * 1000,
@@ -47,12 +48,18 @@ const CONST = {
   RANDOM_DIRS_PER_ROW: 2,
 };
 
+// Telegram Bot API 根地址。
 const TELEGRAM_API_BASE = "https://api.telegram.org";
+// 访问图床及随机接口时使用的默认 UA。
 const TELEGRAM_USER_AGENT = "TelegramBot/1.0";
+// 未配置渠道列表时的默认渠道配置。
 const DEFAULT_CHANNELS = "TG:telegram";
+// 上传时兜底使用的渠道编码。
 const DEFAULT_UPLOAD_CHANNEL = "telegram";
+// 上传目录未指定时的默认目录名称。
 const DEFAULT_DIR = "default";
 
+// 统一收敛界面文案，避免散落硬编码。
 const UI_TEXT = {
   pendingAlbum: "⏳ **正在接收并合并相册，请稍候...**",
   pendingAlbumNoKv: "⏳ **正在缓冲相册队列 (无 KV 模式)...**",
@@ -64,14 +71,22 @@ const UI_TEXT = {
   randomPickDir: "📂 <b>请选择随机范围：</b>",
 };
 
+// 相册处理锁，防止同一 media_group 被重复展开。
 const groupLocks = new Map();
+// 相册处理锁的自动释放定时器。
 const groupLockTimers = new Map();
+// 未接入 KV 时，相册消息的临时内存缓存。
 const noKvCache = new Map();
+// 未接入 KV 时，对应缓存的过期定时器。
 const noKvCacheTimers = new Map();
+// 未接入 KV 时，记录缓存最近一次活跃时间。
 const noKvCacheTouchedAt = new Map();
+// 对 env 解析后的配置缓存，减少重复 split/trim。
 const envConfigCache = new WeakMap();
+// 上次清理内存缓存的时间戳。
 let lastCachePruneAt = 0;
 
+// 私聊场景下注册给 Telegram 的命令列表。
 const COMMANDS_PRIVATE = [
   { command: "list", description: "📂 浏览图床目录" },
   { command: "random", description: "🎲 随机图面板" },
@@ -79,6 +94,7 @@ const COMMANDS_PRIVATE = [
   { command: "init", description: "⚙️ 刷新命令菜单" },
 ];
 
+// 群聊/频道场景下注册给 Telegram 的命令列表。
 const COMMANDS_PUBLIC = [
   { command: "info", description: "ℹ️ 查看消息元数据" },
   { command: "delete", description: "🗑 删除文件" },
@@ -88,10 +104,12 @@ const COMMANDS_PUBLIC = [
 // 🧰 通用工具
 // ==========================================
 
+/** 延迟指定毫秒，常用于等待相册消息收齐。 */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/** 按固定大小切分数组，便于控制 KV 删除并发。 */
 function chunkArray(arr, size) {
   const chunks = [];
   for (let i = 0; i < arr.length; i += size) {
@@ -100,19 +118,29 @@ function chunkArray(arr, size) {
   return chunks;
 }
 
+/** 生成随机字符串，用于临时文件名或兜底标识。 */
 function randomString(len) {
   return Math.random().toString(36).substring(2, 2 + len);
 }
 
+/** 转义 HTML 特殊字符，避免 Telegram HTML 模式下文本被错误解析。 */
 function escapeHtml(text) {
-  return String(text)
-    .replace(/&/g, "&")
-    .replace(/</g, "<")
-    .replace(/>/g, ">")
-    .split(String.fromCharCode(34)).join(""")
-    .split(String.fromCharCode(39)).join("'");
+  const amp = String.fromCharCode(38);
+  const ampEntity = String.fromCharCode(38, 97, 109, 112, 59);
+  const ltEntity = String.fromCharCode(38, 108, 116, 59);
+  const gtEntity = String.fromCharCode(38, 103, 116, 59);
+  const quoteEntity = String.fromCharCode(38, 113, 117, 111, 116, 59);
+  const apostropheEntity = String.fromCharCode(38, 35, 51, 57, 59);
+
+  return String(text ?? ``)
+    .split(amp).join(ampEntity)
+    .split(String.fromCharCode(60)).join(ltEntity)
+    .split(String.fromCharCode(62)).join(gtEntity)
+    .split(String.fromCharCode(34)).join(quoteEntity)
+    .split(String.fromCharCode(39)).join(apostropheEntity);
 }
 
+/** 统一输出错误日志，便于按 scope 排查。 */
 function logError(scope, error, extra = null) {
   const msg = error && error.message ? error.message : String(error);
   if (extra) {
@@ -122,6 +150,7 @@ function logError(scope, error, extra = null) {
   }
 }
 
+/** 安全解析 JSON，失败时返回备用值。 */
 function safeJsonParse(raw, fallback = null) {
   try {
     return JSON.parse(raw);
@@ -130,10 +159,12 @@ function safeJsonParse(raw, fallback = null) {
   }
 }
 
+/** 组装 Telegram API 方法地址。 */
 function buildTelegramUrl(env, method) {
   return `${TELEGRAM_API_BASE}/bot${env.TG_BOT_TOKEN}/${method}`;
 }
 
+/** 解析渠道配置字符串，转成按钮与上传可复用的结构。 */
 function parseChannels(rawChannelList) {
   const raw = rawChannelList || DEFAULT_CHANNELS;
   const list = raw.split(",").map(item => item.trim()).filter(Boolean);
@@ -152,6 +183,7 @@ function parseChannels(rawChannelList) {
   });
 }
 
+/** 解析目录配置字符串，得到目录列表。 */
 function parseDirs(rawDirList) {
   return (rawDirList || "")
     .split(",")
@@ -159,6 +191,7 @@ function parseDirs(rawDirList) {
     .filter(Boolean);
 }
 
+/** 解析并缓存 env 中的渠道、目录、白名单配置。 */
 function getEnvConfig(env) {
   const rawChannels = env.CHANNEL_LIST || "";
   const rawDirs = env.DIR_LIST || "";
@@ -180,31 +213,38 @@ function getEnvConfig(env) {
   return value;
 }
 
+/** 获取当前环境下可用的上传渠道列表。 */
 function getChannels(env) {
   return getEnvConfig(env).channels;
 }
 
+/** 获取当前环境下可用的目录列表。 */
 function getDirs(env) {
   return getEnvConfig(env).dirs;
 }
 
+/** 判断消息发送者是否在允许名单中。 */
 function isUserAllowed(userId, env) {
   return getEnvConfig(env).allowedUsers.has(String(userId));
 }
 
+/** 获取默认上传渠道，通常取渠道列表第一项。 */
 function getDefaultChannelValue(env) {
   const channels = getChannels(env);
   return (channels[0] && channels[0].value) || DEFAULT_UPLOAD_CHANNEL;
 }
 
+/** 包装 Telegram inline keyboard 数据结构。 */
 function createInlineKeyboard(rows) {
   return { inline_keyboard: rows };
 }
 
+/** 解析 callback_data 中的固定前缀与参数片段。 */
 function parseCallbackParts(data, prefix) {
   return String(data || "").slice(prefix.length).split(":");
 }
 
+/** 从 Telegram update 中提取统一上下文，便于后续分发。 */
 function getUpdateContext(update) {
   if (update.message) {
     return {
@@ -236,6 +276,7 @@ function getUpdateContext(update) {
   return null;
 }
 
+/** 根据文件名后缀推断 MIME 类型。 */
 function getMimeType(fileName) {
   const ext = String(fileName || "").split(".").pop().toLowerCase();
   return {
@@ -249,6 +290,7 @@ function getMimeType(fileName) {
   }[ext] || "application/octet-stream";
 }
 
+/** 将字节数格式化为更适合展示的单位。 */
 function formatFileSize(bytes) {
   const num = Number(bytes);
   if (isNaN(num) || num === 0) return "0 B";
@@ -262,6 +304,7 @@ function formatFileSize(bytes) {
   return `${parseFloat((num / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
 }
 
+/** 将时间戳转成东八区可读时间字符串。 */
 function formatTimestamp(ts) {
   const num = Number(ts);
   if (isNaN(num) || num <= 0) return "Unknown Time";
@@ -280,6 +323,7 @@ function formatTimestamp(ts) {
   return `${y}-${m}-${d} ${h}:${min}:${s}`;
 }
 
+/** 从 Telegram 消息中提取文件信息，统一后续上传输入结构。 */
 function getMediaInfo(msg) {
   if (!msg) return null;
 
@@ -339,6 +383,7 @@ function getMediaInfo(msg) {
 // 🧠 缓存与锁
 // ==========================================
 
+/** 获取相册处理锁，避免同一组文件被并发重复处理。 */
 function acquireGroupLock(groupId, ttlMs = CONST.GROUP_LOCK_TTL_MS) {
   const now = Date.now();
   const previous = groupLocks.get(groupId);
@@ -357,6 +402,7 @@ function acquireGroupLock(groupId, ttlMs = CONST.GROUP_LOCK_TTL_MS) {
   return true;
 }
 
+/** 释放相册处理锁并清理对应定时器。 */
 function releaseGroupLock(groupId) {
   groupLocks.delete(groupId);
   const timer = groupLockTimers.get(groupId);
@@ -364,6 +410,7 @@ function releaseGroupLock(groupId) {
   groupLockTimers.delete(groupId);
 }
 
+/** 刷新无 KV 模式下相册缓存的活跃时间。 */
 function touchNoKvCache(groupId) {
   noKvCacheTouchedAt.set(groupId, Date.now());
 
@@ -374,6 +421,7 @@ function touchNoKvCache(groupId) {
   noKvCacheTimers.set(groupId, timer);
 }
 
+/** 清理无 KV 模式的相册缓存，并同步释放锁。 */
 function clearNoKvCache(groupId) {
   noKvCache.delete(groupId);
   noKvCacheTouchedAt.delete(groupId);
@@ -385,6 +433,7 @@ function clearNoKvCache(groupId) {
   releaseGroupLock(groupId);
 }
 
+/** 定时裁剪内存缓存，避免 Worker 常驻时缓存无限增长。 */
 function pruneMemoryCaches() {
   const now = Date.now();
   if (now - lastCachePruneAt < CONST.CACHE_PRUNE_INTERVAL_MS) {
@@ -410,6 +459,7 @@ function pruneMemoryCaches() {
 // 🌐 网络与 Telegram API 封装
 // ==========================================
 
+/** 对 fetch 增加超时控制，避免外部接口长时间挂起。 */
 async function fetchWithTimeout(url, options = {}, timeoutMs = CONST.HTTP_TIMEOUT_MS) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -424,6 +474,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = CONST.HTTP_TIMEOU
   }
 }
 
+/** 统一封装 Telegram API 请求、超时与错误处理。 */
 async function callTelegramApi(method, payload, env, opts = {}) {
   const timeoutMs = opts.timeoutMs || CONST.TELEGRAM_TIMEOUT_MS;
   const muteError = opts.muteError === true;
@@ -458,6 +509,7 @@ async function callTelegramApi(method, payload, env, opts = {}) {
   }
 }
 
+/** 发送普通文本消息。 */
 async function sendTelegramMessage(chatId, text, env, extra = {}) {
   return callTelegramApi("sendMessage", {
     chat_id: chatId,
@@ -468,6 +520,7 @@ async function sendTelegramMessage(chatId, text, env, extra = {}) {
   }, env, { muteError: true });
 }
 
+/** 编辑纯文本消息内容。 */
 async function editMessageText(chatId, messageId, text, env, extra = {}) {
   return callTelegramApi("editMessageText", {
     chat_id: chatId,
@@ -478,6 +531,7 @@ async function editMessageText(chatId, messageId, text, env, extra = {}) {
   }, env, { muteError: true });
 }
 
+/** 编辑媒体消息说明文字。 */
 async function editMessageCaption(chatId, messageId, caption, env, extra = {}) {
   return callTelegramApi("editMessageCaption", {
     chat_id: chatId,
@@ -489,6 +543,7 @@ async function editMessageCaption(chatId, messageId, caption, env, extra = {}) {
   }, env, { muteError: true });
 }
 
+/** 单独更新消息的内联按钮，不修改正文。 */
 async function editMessageReplyMarkup(chatId, messageId, inlineKeyboard, env) {
   return callTelegramApi("editMessageReplyMarkup", {
     chat_id: chatId,
@@ -497,6 +552,7 @@ async function editMessageReplyMarkup(chatId, messageId, inlineKeyboard, env) {
   }, env, { muteError: true });
 }
 
+/** 删除指定聊天中的某条消息。 */
 async function deleteMessage(chatId, messageId, env) {
   return callTelegramApi("deleteMessage", {
     chat_id: chatId,
@@ -504,6 +560,7 @@ async function deleteMessage(chatId, messageId, env) {
   }, env, { muteError: true });
 }
 
+/** 应答按钮点击，避免 Telegram 客户端一直转圈。 */
 async function answerCallbackQuery(id, text, env) {
   const payload = { callback_query_id: id };
   if (typeof text === "string" && text.length > 0) {
@@ -512,14 +569,72 @@ async function answerCallbackQuery(id, text, env) {
   return callTelegramApi("answerCallbackQuery", payload, env, { muteError: true });
 }
 
+/** 发送媒体消息，供图片/视频/文件面板复用。 */
 async function sendTelegramMedia(method, payload, env) {
   return callTelegramApi(method, payload, env, { muteError: true });
+}
+
+/** 根据消息类型判断应该编辑文本还是 caption。 */
+function getMessageEditMethod(message) {
+  if (message && (message.photo || message.video || message.animation || message.document)) {
+    return "editMessageCaption";
+  }
+  return "editMessageText";
+}
+
+/** 统一更新面板消息，自动兼容文本消息与媒体消息。 */
+async function updatePanelMessage(chatId, message, content, env, extra = {}) {
+  const method = getMessageEditMethod(message);
+  const messageId = message.message_id;
+
+  if (method === "editMessageCaption") {
+    return callTelegramApi(method, {
+      chat_id: chatId,
+      message_id: messageId,
+      caption: content,
+      ...extra,
+    }, env, { muteError: true });
+  }
+
+  return callTelegramApi(method, {
+    chat_id: chatId,
+    message_id: messageId,
+    text: content,
+    ...extra,
+  }, env, { muteError: true });
+}
+
+/** 生成命令路由器，简化 if/else 命令分发。 */
+function createCommandRouter(routes) {
+  return async (text, context) => {
+    for (const route of routes) {
+      if (route.match(text, context)) {
+        await route.handler(context);
+        return true;
+      }
+    }
+    return false;
+  };
+}
+
+/** 生成 callback 路由器，集中管理按钮事件分发。 */
+function createPrefixCallbackRouter(routes) {
+  return async (data, context) => {
+    for (const route of routes) {
+      if (route.match(data, context)) {
+        await route.handler(context);
+        return true;
+      }
+    }
+    return false;
+  };
 }
 
 // ==========================================
 // 🎹 UI 键盘构建
 // ==========================================
 
+/** 构建单文件/批量上传共用的渠道与目录选择面板。 */
 function buildUnifiedKeyboard(channels, dirs, selectedChannel, isBatch) {
   const keyboard = [];
   let channelRow = [];
@@ -570,6 +685,7 @@ function buildUnifiedKeyboard(channels, dirs, selectedChannel, isBatch) {
   return keyboard;
 }
 
+/** 构建目录浏览入口面板。 */
 function buildDirKeyboard(dirs, cmdId = "") {
   const keyboard = [];
   let row = [];
@@ -586,6 +702,7 @@ function buildDirKeyboard(dirs, cmdId = "") {
   return keyboard;
 }
 
+/** 构建随机图模块的目录切换面板。 */
 function buildRandomDirKeyboard(dirs, currentDir, cmdId = "") {
   const keyboard = [];
   keyboard.push([
@@ -612,6 +729,7 @@ function buildRandomDirKeyboard(dirs, currentDir, cmdId = "") {
   return keyboard;
 }
 
+/** 构建相册收到后选择统一/分别上传的面板。 */
 function buildBatchModeKeyboard() {
   return [
     [{ text: "📦 统一上传 (推荐)", callback_data: "mode:unify" }],
@@ -620,6 +738,7 @@ function buildBatchModeKeyboard() {
   ];
 }
 
+/** 构建无 KV 模式下的降级操作面板。 */
 function buildNoKvKeyboard(groupId, count) {
   return [
     [{ text: `📑 分别单独上传 (${count}个文件)`, callback_data: `nokv_sep:${groupId}` }],
@@ -627,6 +746,7 @@ function buildNoKvKeyboard(groupId, count) {
   ];
 }
 
+/** 构建随机图查看面板。 */
 function buildRandomViewerKeyboard(dir, cmdId = "") {
   return [
     [
@@ -637,6 +757,7 @@ function buildRandomViewerKeyboard(dir, cmdId = "") {
   ];
 }
 
+/** 构建随机图获取失败时的兜底按钮。 */
 function buildRandomErrorKeyboard(dir, cmdId = "") {
   return [
     [{ text: "📂 切换目录", callback_data: `rnd:pick:${dir}:${cmdId}` }],
@@ -648,6 +769,7 @@ function buildRandomErrorKeyboard(dir, cmdId = "") {
 // 📩 更新入口
 // ==========================================
 
+/** 统一分发 Telegram update，并在入口处顺带清理过期内存缓存。 */
 async function handleUpdate(update, env, ctx) {
   pruneMemoryCaches();
 
@@ -674,32 +796,44 @@ async function handleUpdate(update, env, ctx) {
   await handlePublicChatMessage(msg, text, chatId, env, ctx);
 }
 
+const handlePrivateCommand = createCommandRouter([
+  {
+    match: text => text === "/init",
+    handler: async ({ chatId, env }) => {
+      await handleInitCommand(chatId, env);
+    },
+  },
+  {
+    match: text => text.startsWith("/list"),
+    handler: async ({ chatId, env, msg }) => {
+      const dirs = getDirs(env);
+      if (dirs.length === 0) {
+        await sendTelegramMessage(chatId, "❌ 未配置 `DIR_LIST`", env);
+        return;
+      }
+      await sendDirectoryBrowser(chatId, dirs, env, msg.message_id);
+    },
+  },
+  {
+    match: text => text === "/reset",
+    handler: async ({ chatId, env }) => {
+      await sendTelegramMessage(chatId, "⏳ 正在重置上传状态...", env);
+      const count = await clearAllKV(env);
+      await sendTelegramMessage(chatId, `✅ 上传已重置。\n🗑 已清理 ${count} 条临时缓存。`, env);
+    },
+  },
+  {
+    match: text => text === "/random",
+    handler: async ({ chatId, env, msg }) => {
+      await sendRandomPanel(chatId, "all", env, msg.message_id);
+    },
+  },
+]);
+
+/** 处理私聊消息，优先命令分发，其次进入单文件或相册上传流程。 */
 async function handlePrivateChatMessage(msg, text, chatId, env, ctx) {
-  const dirs = getDirs(env);
-
-  if (text === "/init") {
-    await handleInitCommand(chatId, env);
-    return;
-  }
-
-  if (text.startsWith("/list")) {
-    if (dirs.length === 0) {
-      await sendTelegramMessage(chatId, "❌ 未配置 `DIR_LIST`", env);
-      return;
-    }
-    await sendDirectoryBrowser(chatId, dirs, env, msg.message_id);
-    return;
-  }
-
-  if (text === "/reset") {
-    await sendTelegramMessage(chatId, "⏳ 正在重置上传状态...", env);
-    const count = await clearAllKV(env);
-    await sendTelegramMessage(chatId, `✅ 上传已重置。\n🗑 已清理 ${count} 条临时缓存。`, env);
-    return;
-  }
-
-  if (text === "/random") {
-    await sendRandomPanel(chatId, "all", env, msg.message_id);
+  const commandHandled = await handlePrivateCommand(text, { msg, text, chatId, env, ctx });
+  if (commandHandled) {
     return;
   }
 
@@ -721,34 +855,44 @@ async function handlePrivateChatMessage(msg, text, chatId, env, ctx) {
   await sendUnifiedPanel(chatId, mediaInfo, getDefaultChannelValue(env), env);
 }
 
-async function handlePublicChatMessage(msg, text, chatId, env, ctx) {
-  if (text === "/info") {
-    await handleInfoCommand(msg, chatId, env, ctx);
-    return;
-  }
+const handlePublicCommand = createCommandRouter([
+  {
+    match: text => text === "/info",
+    handler: async ({ msg, chatId, env, ctx }) => {
+      await handleInfoCommand(msg, chatId, env, ctx);
+    },
+  },
+  {
+    match: text => text === "/delete",
+    handler: async ({ msg, chatId, env, ctx }) => {
+      if (!msg.reply_to_message) {
+        const res = await callTelegramApi("sendMessage", {
+          chat_id: chatId,
+          text: "❌ 请回复一张要删除的图片消息",
+          reply_to_message_id: msg.message_id,
+        }, env, { muteError: true });
 
-  if (text === "/delete") {
-    if (!msg.reply_to_message) {
-      const res = await callTelegramApi("sendMessage", {
-        chat_id: chatId,
-        text: "❌ 请回复一张要删除的图片消息",
-        reply_to_message_id: msg.message_id,
-      }, env, { muteError: true });
-
-      if (res.ok && res.result && res.result.message_id) {
-        ctx.waitUntil(delayDelete(chatId, [msg.message_id, res.result.message_id], env));
+        if (res.ok && res.result && res.result.message_id) {
+          ctx.waitUntil(delayDelete(chatId, [msg.message_id, res.result.message_id], env));
+        }
+        return;
       }
-      return;
-    }
 
-    await handleDeleteCommand(msg, chatId, env, ctx);
-  }
+      await handleDeleteCommand(msg, chatId, env, ctx);
+    },
+  },
+]);
+
+/** 处理群组或频道中的公开命令，目前主要承载查询与删除能力。 */
+async function handlePublicChatMessage(msg, text, chatId, env, ctx) {
+  await handlePublicCommand(text, { msg, text, chatId, env, ctx });
 }
 
 // ==========================================
 // 🧾 命令处理
 // ==========================================
 
+/** 手动刷新机器人命令菜单，便于私聊和群聊命令及时生效。 */
 async function handleInitCommand(chatId, env) {
   await sendTelegramMessage(chatId, "🔄 正在强制刷新命令菜单...", env);
 
@@ -768,6 +912,7 @@ async function handleInitCommand(chatId, env) {
   }
 }
 
+/** 按不同聊天作用域批量注册 Telegram 命令菜单。 */
 async function setupBotCommands(env, targetChatId = null) {
   const url = buildTelegramUrl(env, "setMyCommands");
   const requests = [];
@@ -812,6 +957,7 @@ async function setupBotCommands(env, targetChatId = null) {
 // 📦 批量处理
 // ==========================================
 
+/** 基于 TG_KV 预处理相册消息，等待收齐后展示统一批量操作面板。 */
 async function handleBatchPreProcess(msg, mediaInfo, env) {
   const groupId = msg.media_group_id;
   const chatId = msg.chat.id;
@@ -850,6 +996,7 @@ async function handleBatchPreProcess(msg, mediaInfo, env) {
   }
 }
 
+/** 优先复用等待中的提示消息，不可复用时再补发批量模式选择面板。 */
 async function ensureBatchModePanel(chatId, replyToMessageId, pendingMsgId, keyboard, env) {
   if (pendingMsgId) {
     const editRes = await callTelegramApi("editMessageText", {
@@ -876,6 +1023,7 @@ async function ensureBatchModePanel(chatId, replyToMessageId, pendingMsgId, keyb
   return sendRes.ok ? sendRes.result.message_id : null;
 }
 
+/** 在未配置 TG_KV 时退化为内存缓存方案，并提示用户选择如何拆分相册。 */
 async function handleNoKvBatch(msg, mediaInfo, env) {
   const groupId = msg.media_group_id;
   const chatId = msg.chat.id;
@@ -927,77 +1075,74 @@ async function handleNoKvBatch(msg, mediaInfo, env) {
 // 🖱️ 回调交互总入口
 // ==========================================
 
+const handleCallbackRoute = createPrefixCallbackRouter([
+  {
+    match: data => data.startsWith("switch_chan:"),
+    handler: async ({ query, env }) => handleSwitchChannelCallback(query, env),
+  },
+  {
+    match: data => data.startsWith("mode:"),
+    handler: async ({ query, env }) => handleBatchModeSelection(query, env),
+  },
+  {
+    match: data => data.startsWith("batch_upload:"),
+    handler: async ({ query, env }) => handleBatchUploadCallback(query, env),
+  },
+  {
+    match: data => data.startsWith("upload:"),
+    handler: async ({ query, env }) => handleSingleUploadCallback(query, env),
+  },
+  {
+    match: data => data === "upload_cancel" || data === "batch_cancel",
+    handler: async ({ query, env, chatId, messageId }) => {
+      await answerCallbackQuery(query.id, "已取消", env);
+      await deleteMessage(chatId, messageId, env);
+    },
+  },
+  {
+    match: data => data.startsWith("nokv_sep:"),
+    handler: async ({ query, env }) => handleNoKvSeparateCallback(query, env),
+  },
+  {
+    match: data => data.startsWith("nokv_cancel:"),
+    handler: async ({ query, env }) => handleNoKvCancelCallback(query, env),
+  },
+  {
+    match: data => data.startsWith("close_panel"),
+    handler: async ({ query, env }) => handleClosePanelCallback(query, env),
+  },
+  {
+    match: data => data.startsWith("rnd:"),
+    handler: async ({ query, env }) => handleRandomCallback(query, env),
+  },
+  {
+    match: data => data.startsWith("browse:"),
+    handler: async ({ query, env }) => handleBrowseCallback(query, env),
+  },
+  {
+    match: data => data.startsWith("list_refresh_root"),
+    handler: async ({ query, env }) => handleListRefreshRootCallback(query, env),
+  },
+  {
+    match: data => data.startsWith("confirm_del:"),
+    handler: async ({ query, env, ctx }) => handleConfirmDeleteCallback(query, env, ctx),
+  },
+  {
+    match: data => data === "ignore",
+    handler: async ({ query, env }) => answerCallbackQuery(query.id, "处理中，请稍候...", env),
+  },
+]);
+
+/** 回调总入口，仅负责提取上下文并交给路由器分发。 */
 async function handleCallback(query, env, ctx) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
   const data = query.data || "";
 
-  if (data.startsWith("switch_chan:")) {
-    await handleSwitchChannelCallback(query, env);
-    return;
-  }
-
-  if (data.startsWith("mode:")) {
-    await handleBatchModeSelection(query, env);
-    return;
-  }
-
-  if (data.startsWith("batch_upload:")) {
-    await handleBatchUploadCallback(query, env);
-    return;
-  }
-
-  if (data.startsWith("upload:")) {
-    await handleSingleUploadCallback(query, env);
-    return;
-  }
-
-  if (data === "upload_cancel" || data === "batch_cancel") {
-    await answerCallbackQuery(query.id, "已取消", env);
-    await deleteMessage(chatId, messageId, env);
-    return;
-  }
-
-  if (data.startsWith("nokv_sep:")) {
-    await handleNoKvSeparateCallback(query, env);
-    return;
-  }
-
-  if (data.startsWith("nokv_cancel:")) {
-    await handleNoKvCancelCallback(query, env);
-    return;
-  }
-
-  if (data.startsWith("close_panel")) {
-    await handleClosePanelCallback(query, env);
-    return;
-  }
-
-  if (data.startsWith("rnd:")) {
-    await handleRandomCallback(query, env);
-    return;
-  }
-
-  if (data.startsWith("browse:")) {
-    await handleBrowseCallback(query, env);
-    return;
-  }
-
-  if (data.startsWith("list_refresh_root")) {
-    await handleListRefreshRootCallback(query, env);
-    return;
-  }
-
-  if (data.startsWith("confirm_del:")) {
-    await handleConfirmDeleteCallback(query, env, ctx);
-    return;
-  }
-
-  if (data === "ignore") {
-    await answerCallbackQuery(query.id, "处理中，请稍候...", env);
-  }
+  await handleCallbackRoute(data, { query, env, ctx, chatId, messageId });
 }
 
+/** 切换上传渠道时，仅刷新当前面板键盘，不改动正文内容。 */
 async function handleSwitchChannelCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -1016,6 +1161,7 @@ async function handleSwitchChannelCallback(query, env) {
   }
 }
 
+/** 处理相册模式选择，决定进入统一上传或拆分为独立面板。 */
 async function handleBatchModeSelection(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -1062,6 +1208,7 @@ async function handleBatchModeSelection(query, env) {
   }
 }
 
+/** 执行整组相册的批量上传，并在原面板中汇总展示结果。 */
 async function handleBatchUploadCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -1128,19 +1275,23 @@ async function handleBatchUploadCallback(query, env) {
   }, env, { muteError: true });
 }
 
+/** 处理单文件上传按钮，更新面板状态后进入正式上传流程。 */
 async function handleSingleUploadCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
   const [targetDir, channelCode] = parseCallbackParts(query.data, "upload:");
 
   await answerCallbackQuery(query.id, "🚀 开始上传...", env);
-  await callTelegramApi("editMessageCaption", {
-    chat_id: chatId,
-    message_id: messageId,
-    caption: `⏳ <b>正在上传至 [${escapeHtml(targetDir)}]</b>\n📡 渠道: <code>${escapeHtml(channelCode)}</code>\n\n请稍候，正在传输数据...`,
-    parse_mode: "HTML",
-    reply_markup: createInlineKeyboard([]),
-  }, env, { muteError: true });
+  await updatePanelMessage(
+    chatId,
+    query.message,
+    `⏳ <b>正在上传至 [${escapeHtml(targetDir)}]</b>\n📡 渠道: <code>${escapeHtml(channelCode)}</code>\n\n请稍候，正在传输数据...`,
+    env,
+    {
+      parse_mode: "HTML",
+      reply_markup: createInlineKeyboard([]),
+    },
+  );
 
   let mediaInfo = getMediaInfo(query.message);
   if (!mediaInfo && query.message.reply_to_message) {
@@ -1148,13 +1299,17 @@ async function handleSingleUploadCallback(query, env) {
   }
 
   if (mediaInfo) {
-    await processUpload(chatId, mediaInfo, targetDir, channelCode, env, messageId);
+    await processUpload(chatId, mediaInfo, targetDir, channelCode, env, messageId, query.message);
     return;
   }
 
-  await editMessageCaption(chatId, messageId, "❌ 文件信息过期，请重新发送文件", env);
+  await updatePanelMessage(chatId, query.message, "❌ 文件信息过期，请重新发送文件", env, {
+    parse_mode: "HTML",
+    reply_markup: createInlineKeyboard([]),
+  });
 }
 
+/** 未启用 TG_KV 时，将相册中的每个文件展开成独立上传面板。 */
 async function handleNoKvSeparateCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -1189,6 +1344,7 @@ async function handleNoKvSeparateCallback(query, env) {
   await answerCallbackQuery(query.id, "面板已展开", env);
 }
 
+/** 取消无 KV 相册处理，并清理内存中的临时聚合数据。 */
 async function handleNoKvCancelCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -1199,6 +1355,7 @@ async function handleNoKvCancelCallback(query, env) {
   await answerCallbackQuery(query.id, "已取消操作", env);
 }
 
+/** 关闭交互面板，并在需要时顺带删除对应的命令消息。 */
 async function handleClosePanelCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -1210,6 +1367,7 @@ async function handleClosePanelCallback(query, env) {
   }
 }
 
+/** 处理随机图面板中的翻页、切目录与目录选择等交互。 */
 async function handleRandomCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -1253,6 +1411,7 @@ async function handleRandomCallback(query, env) {
   }
 }
 
+/** 处理文件浏览分页请求，并按页渲染指定目录内容。 */
 async function handleBrowseCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -1263,6 +1422,7 @@ async function handleBrowseCallback(query, env) {
   await renderFilePage(chatId, messageId, dir, page, env, cmdId);
 }
 
+/** 从分页视图返回目录根列表，便于重新选择浏览路径。 */
 async function handleListRefreshRootCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -1272,6 +1432,7 @@ async function handleListRefreshRootCallback(query, env) {
   await editToDirectoryBrowser(chatId, messageId, getDirs(env), env, cmdId);
 }
 
+/** 处理图床删除确认弹窗，负责真正执行删除或取消任务。 */
 async function handleConfirmDeleteCallback(query, env, ctx) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -1327,21 +1488,40 @@ async function handleConfirmDeleteCallback(query, env, ctx) {
 // 📤 上传能力
 // ==========================================
 
+/** 根据媒体类型选择 Telegram 发送方法及其对应参数名。 */
+function resolveTelegramMediaMethod(mediaInfo) {
+  if (mediaInfo.type === "photo" || (mediaInfo.isUrl && mediaInfo.type === "photo")) {
+    return { method: "sendPhoto", paramName: "photo" };
+  }
+
+  if (mediaInfo.type === "video") {
+    return { method: "sendVideo", paramName: "video" };
+  }
+
+  return { method: "sendDocument", paramName: "document" };
+}
+
+/** 生成上传中的面板文案，统一展示目标目录与上传渠道。 */
+function buildUploadProgressText(targetDir, channelCode) {
+  return `⏳ <b>正在上传至 [${escapeHtml(targetDir)}]</b>\n📡 渠道: <code>${escapeHtml(channelCode)}</code>\n\n请稍候，正在传输数据...`;
+}
+
+/** 生成上传成功后的结果文案，便于用户直接复制或核对链接。 */
+function buildUploadSuccessText(targetDir, channelCode, uploadResult) {
+  return `✅ <b>上传成功!</b>\n\n📂 目录: <code>${escapeHtml(targetDir)}</code>\n📡 渠道: <code>${escapeHtml(channelCode)}</code>\n\n🏠 <b>源链</b>: <code>${escapeHtml(uploadResult.originUrl)}</code>\n🚀 <b>外链</b>: <code>${escapeHtml(uploadResult.accessUrl)}</code>`;
+}
+
+/** 生成上传失败文案，统一对错误信息做 HTML 转义。 */
+function buildUploadErrorText(errorMessage) {
+  return `❌ <b>上传失败</b>: <code>${escapeHtml(errorMessage)}</code>`;
+}
+
+/** 为单个媒体发送统一配置面板，供用户选择渠道与目录后上传。 */
 async function sendUnifiedPanel(chatId, mediaInfo, defaultChannel, env) {
   const channels = getChannels(env);
   const dirs = getDirs(env);
   const keyboard = buildUnifiedKeyboard(channels, dirs, defaultChannel, false);
-
-  let method = "sendDocument";
-  let paramName = "document";
-
-  if (mediaInfo.type === "photo" || (mediaInfo.isUrl && mediaInfo.type === "photo")) {
-    method = "sendPhoto";
-    paramName = "photo";
-  } else if (mediaInfo.type === "video") {
-    method = "sendVideo";
-    paramName = "video";
-  }
+  const { method, paramName } = resolveTelegramMediaMethod(mediaInfo);
 
   await sendTelegramMedia(method, {
     chat_id: chatId,
@@ -1352,7 +1532,8 @@ async function sendUnifiedPanel(chatId, mediaInfo, defaultChannel, env) {
   }, env);
 }
 
-async function processUpload(chatId, mediaInfo, targetDir, channelCode, env, messageIdToEdit = null) {
+/** 负责上传结果的展示层逻辑，可选择回写原面板或额外发送结果消息。 */
+async function processUpload(chatId, mediaInfo, targetDir, channelCode, env, messageIdToEdit = null, originalMessage = null) {
   if (!messageIdToEdit) {
     await sendTelegramMessage(chatId, "⏳ 正在处理...", env);
   }
@@ -1360,23 +1541,40 @@ async function processUpload(chatId, mediaInfo, targetDir, channelCode, env, mes
   const uploadResult = await processUploadInternal(mediaInfo, targetDir, channelCode, env);
 
   if (uploadResult.success) {
-    const successText = `✅ **上传成功!**\n\n📂 目录: \`${targetDir}\`\n📡 渠道: \`${channelCode}\`\n\n🏠 **源链**: \`${uploadResult.originUrl}\`\n🚀 **外链**: \`${uploadResult.accessUrl}\``;
-    if (messageIdToEdit) {
-      await editMessageCaption(chatId, messageIdToEdit, successText, env);
+    const successText = buildUploadSuccessText(targetDir, channelCode, uploadResult);
+    if (messageIdToEdit && originalMessage) {
+      await updatePanelMessage(chatId, originalMessage, successText, env, {
+        parse_mode: "HTML",
+        reply_markup: createInlineKeyboard([]),
+      });
     } else {
-      await sendTelegramMessage(chatId, successText, env);
+      await callTelegramApi("sendMessage", {
+        chat_id: chatId,
+        text: successText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }, env, { muteError: true });
     }
     return;
   }
 
-  const errText = `❌ **上传失败**: ${uploadResult.error}`;
-  if (messageIdToEdit) {
-    await editMessageCaption(chatId, messageIdToEdit, errText, env);
+  const errText = buildUploadErrorText(uploadResult.error);
+  if (messageIdToEdit && originalMessage) {
+    await updatePanelMessage(chatId, originalMessage, errText, env, {
+      parse_mode: "HTML",
+      reply_markup: createInlineKeyboard([]),
+    });
   } else {
-    await sendTelegramMessage(chatId, errText, env);
+    await callTelegramApi("sendMessage", {
+      chat_id: chatId,
+      text: errText,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    }, env, { muteError: true });
   }
 }
 
+/** 执行真实上传链路：先下载媒体，再提交到图床接口。 */
 async function processUploadInternal(mediaInfo, targetDir, channelCode, env) {
   try {
     const fileBlob = await downloadMediaAsBlob(mediaInfo, env);
@@ -1386,6 +1584,7 @@ async function processUploadInternal(mediaInfo, targetDir, channelCode, env) {
   }
 }
 
+/** 将 Telegram 文件或外部 URL 下载为 Blob，供后续上传接口复用。 */
 async function downloadMediaAsBlob(mediaInfo, env) {
   if (mediaInfo.isUrl) {
     const fileRes = await fetch(mediaInfo.fileId, {
@@ -1418,6 +1617,7 @@ async function downloadMediaAsBlob(mediaInfo, env) {
   return originalBlob.slice(0, originalBlob.size, correctMimeType);
 }
 
+/** 解析上传渠道配置，兼容 `provider|channelName` 这种复合写法。 */
 function resolveUploadChannel(channel) {
   let provider = channel || DEFAULT_UPLOAD_CHANNEL;
   let channelName = null;
@@ -1431,6 +1631,7 @@ function resolveUploadChannel(channel) {
   return { provider, channelName };
 }
 
+/** 将文件提交到图床上传接口，并整理源地址与对外访问地址。 */
 async function uploadToImageHost(fileBlob, fileName, directory, channel, env) {
   const formData = new FormData();
   formData.append("file", fileBlob, fileName);
@@ -1485,6 +1686,7 @@ async function uploadToImageHost(fileBlob, fileName, directory, channel, env) {
 // 📂 浏览功能
 // ==========================================
 
+/** 发送目录浏览入口面板，供用户选择要查看的目录。 */
 async function sendDirectoryBrowser(chatId, dirs, env, cmdId = "") {
   await callTelegramApi("sendMessage", {
     chat_id: chatId,
@@ -1494,6 +1696,7 @@ async function sendDirectoryBrowser(chatId, dirs, env, cmdId = "") {
   }, env, { muteError: true });
 }
 
+/** 将现有消息切换回目录浏览入口，避免反复新发消息。 */
 async function editToDirectoryBrowser(chatId, messageId, dirs, env, cmdId = "") {
   await callTelegramApi("editMessageText", {
     chat_id: chatId,
@@ -1504,6 +1707,7 @@ async function editToDirectoryBrowser(chatId, messageId, dirs, env, cmdId = "") 
   }, env, { muteError: true });
 }
 
+/** 拉取指定目录分页数据，并将文件列表渲染到浏览面板。 */
 async function renderFilePage(chatId, messageId, dir, page, env, cmdId = "") {
   const listToken = env.API_LIST_TOKEN;
   if (!listToken) {
@@ -1648,6 +1852,7 @@ async function renderFilePage(chatId, messageId, dir, page, env, cmdId = "") {
 // 🎲 随机图模块
 // ==========================================
 
+/** 发送随机图加载面板，并在消息创建成功后继续渲染具体媒体。 */
 async function sendRandomPanel(chatId, dir, env, userCmdId = "") {
   const sent = await callTelegramApi("sendMessage", {
     chat_id: chatId,
@@ -1661,6 +1866,7 @@ async function sendRandomPanel(chatId, dir, env, userCmdId = "") {
   }
 }
 
+/** 拉取随机图片或视频，并以发送或编辑媒体的方式刷新展示内容。 */
 async function renderRandomImage(chatId, messageId, dir, env, isEditMedia, userCmdId = "") {
   const errorKeyboard = buildRandomErrorKeyboard(dir, userCmdId);
 
@@ -1761,6 +1967,7 @@ async function renderRandomImage(chatId, messageId, dir, env, isEditMedia, userC
 // ℹ️ /info 与 🗑 /delete
 // ==========================================
 
+/** 输出消息与媒体元数据，便于排查上传、索引或文件映射问题。 */
 async function handleInfoCommand(msg, chatId, env, ctx) {
   const targetMsg = msg.reply_to_message || msg;
   const mediaInfo = getMediaInfo(targetMsg);
@@ -1793,6 +2000,7 @@ async function handleInfoCommand(msg, chatId, env, ctx) {
   }
 }
 
+/** 根据回复的媒体消息查找图床索引，并弹出删除确认面板。 */
 async function handleDeleteCommand(msg, chatId, env, ctx) {
   const targetMsg = msg.reply_to_message;
   const mediaInfo = getMediaInfo(targetMsg);
@@ -1858,6 +2066,7 @@ async function handleDeleteCommand(msg, chatId, env, ctx) {
   }
 }
 
+/** 调用图床删除接口，删除指定存储路径对应的文件。 */
 async function deleteFromImageHost(path, env) {
   if (!env.API_DELETE_TOKEN) {
     return { success: false, error: "未配置 API_DELETE_TOKEN" };
@@ -1905,6 +2114,7 @@ async function deleteFromImageHost(path, env) {
 // 🧹 延迟清理与 KV 重置
 // ==========================================
 
+/** 延迟清理一组消息，常用于短暂提示信息的自动回收。 */
 async function delayDelete(chatId, messageIds, env) {
   await sleep(CONST.AUTO_DELETE_DELAY_MS);
 
@@ -1917,6 +2127,7 @@ async function delayDelete(chatId, messageIds, env) {
   }));
 }
 
+/** 清空 TG_KV 中的临时状态数据，供 `/reset` 命令统一调用。 */
 async function clearAllKV(env) {
   if (!env.TG_KV) {
     return 0;
