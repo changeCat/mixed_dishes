@@ -1,259 +1,457 @@
 // =================================================================
-// 1. 辅助函数定义 (All Helper Functions First)
+// Proxy Rule Telegram Bot for Cloudflare Workers
 // =================================================================
+
+const KV_KEYS = {
+  PROXY: 'proxy_rules',
+  DIRECT: 'direct_rules',
+};
+
+const DEFAULT_SUPPORTED_TYPES = ['DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD'];
+const BATCH_COMMANDS = new Set(['set', 'move', 'delete']);
+const LIST_COMMANDS = {
+  proxylist: { key: KV_KEYS.PROXY, title: 'PROXY 代理列表' },
+  directlist: { key: KV_KEYS.DIRECT, title: 'DIRECT 直连列表' },
+};
 
 function escapeMarkdown(text) {
   if (typeof text !== 'string') return '';
   return text.replace(/([_{}\[\]()#+\-|=.!])/g, '\\$1');
 }
 
+function normalizeInputLine(line) {
+  return typeof line === 'string' ? line.trim() : '';
+}
+
+function normalizeRuleType(type) {
+  return normalizeInputLine(type).toUpperCase();
+}
+
+function normalizeListName(listName) {
+  return normalizeInputLine(listName).toUpperCase();
+}
+
+function normalizeDomain(domain) {
+  return normalizeInputLine(domain);
+}
+
 function getSupportedTypes(env) {
-    return Array.isArray(env.SUPPORTED_TYPES) ? env.SUPPORTED_TYPES : ['DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD'];
+  const types = Array.isArray(env?.SUPPORTED_TYPES) ? env.SUPPORTED_TYPES : DEFAULT_SUPPORTED_TYPES;
+  return [...new Set(types.map(normalizeRuleType).filter(Boolean))];
 }
 
-async function sendMessage(chatId, text, env, parseMode = '') {
-  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const payload = { chat_id: chatId, text: text };
-  if (parseMode) payload.parse_mode = parseMode;
-  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-}
-
-async function editMessage(chatId, messageId, text, env, parseMode = 'MarkdownV2') {
-    const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`;
-    const payload = { chat_id: chatId, message_id: messageId, text: text, parse_mode: parseMode };
-    await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-}
-
-async function showList(chatId, env, listKey, title) {
-  const rules = await env.RULE_STORE.get(listKey, 'text') || `# ${title}为空。`;
-  await sendMessage(chatId, `*${escapeMarkdown(title)}*\n\`\`\`\n${rules}\n\`\`\``, env, 'MarkdownV2');
+function parseAuthorizedUsers(env) {
+  return new Set(
+    String(env?.AUTHORIZED_USERS || '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean),
+  );
 }
 
 function getKvKey(listName) {
-    const list = listName.toUpperCase();
-    if (list === 'PROXY') return 'proxy_rules';
-    if (list === 'DIRECT') return 'direct_rules';
-    return null;
+  return KV_KEYS[normalizeListName(listName)] || null;
 }
 
-function buildReport(title, successes, failures, successFormatter = (line) => line) {
-    let report = `*${escapeMarkdown(title)}*\n\n`;
-    if (successes.length > 0) {
-        const successHeader = `✅ 成功 (${successes.length}条):`;
-        report += `*${escapeMarkdown(successHeader)}*\n`;
-        const successText = successes.map(s => successFormatter(s)).join('\n');
-        report += `\`\`\`\n${successText}\n\`\`\`\n`;
-    }
-    if (failures.length > 0) {
-        const failureHeader = `❌ 失败 (${failures.length}条):`;
-        report += `*${escapeMarkdown(failureHeader)}*\n`;
-        const failureText = failures.join('\n');
-        report += `\`\`\`\n${failureText}\n\`\`\``;
-    }
-    if (successes.length === 0 && failures.length === 0) {
-        report += escapeMarkdown("没有提供有效数据。");
-    }
-    return report;
+function getListDisplayNameByKey(listKey) {
+  if (listKey === KV_KEYS.PROXY) return 'PROXY';
+  if (listKey === KV_KEYS.DIRECT) return 'DIRECT';
+  return listKey;
 }
 
-/**
- * 【重构核心】这是一个纯粹的计算函数，它只返回计算结果，不执行IO操作
- * @returns {{ report: string, proxyData: string, directData: string }}
- */
-async function processRules(command, lines, env) {
-    let successes = [];
-    let failures = [];
-    
-    // 1. 批量读取
-    const proxyRulesText = await env.RULE_STORE.get('proxy_rules', 'text') || '';
-    const directRulesText = await env.RULE_STORE.get('direct_rules', 'text') || '';
-    let proxyRules = proxyRulesText.split('\n').filter(Boolean);
-    let directRules = directRulesText.split('\n').filter(Boolean);
+function parseRuleLine(ruleLine) {
+  const normalized = normalizeInputLine(ruleLine);
+  if (!normalized) return null;
 
-    // 2. 在内存中处理
-    for (const line of lines) {
-        if (command === 'set') {
-            const parts = line.split(',').map(s => s.trim());
-            if (parts.length !== 3) { failures.push(`格式错误: ${line}`); continue; }
-            const [type, domain, listName] = parts;
-            if (!type || !domain || !listName) { failures.push(`内容不全: ${line}`); continue; }
-            const supportedTypes = getSupportedTypes(env);
-            if (!supportedTypes.includes(type.toUpperCase())) { failures.push(`类型不支持: ${line}`); continue; }
-            const targetKey = getKvKey(listName);
-            if (!targetKey) { failures.push(`列表名称错误: ${line}`); continue; }
-            proxyRules = proxyRules.filter(r => !r.endsWith(`,${domain}`));
-            directRules = directRules.filter(r => !r.endsWith(`,${domain}`));
-            const newRule = `${type.toUpperCase()},${domain}`;
-            if (targetKey === 'proxy_rules') proxyRules.push(newRule);
-            else directRules.push(newRule);
-            successes.push(line);
-        } else if (command === 'move') {
-            const parts = line.split(',').map(s => s.trim());
-            if (parts.length !== 2) { failures.push(`格式错误: ${line}`); continue; }
-            const [domain, listName] = parts;
-            if (!domain || !listName) { failures.push(`内容不全: ${line}`); continue; }
-            const targetKey = getKvKey(listName);
-            if (!targetKey) { failures.push(`列表名称错误: ${line}`); continue; }
-            let foundRule = proxyRules.find(r => r.endsWith(`,${domain}`)) || directRules.find(r => r.endsWith(`,${domain}`));
-            if (foundRule) {
-                proxyRules = proxyRules.filter(r => !r.endsWith(`,${domain}`));
-                directRules = directRules.filter(r => !r.endsWith(`,${domain}`));
-                if (targetKey === 'proxy_rules') proxyRules.push(foundRule);
-                else directRules.push(foundRule);
-                successes.push({ originalRule: foundRule, targetList: listName.toUpperCase() });
-            } else {
-                failures.push(`未找到: ${domain}`);
-            }
-        } else if (command === 'delete') {
-            const domain = line;
-            let ruleFound = false;
-            const initialProxyLength = proxyRules.length;
-            proxyRules = proxyRules.filter(r => !r.endsWith(`,${domain}`));
-            if (proxyRules.length < initialProxyLength) ruleFound = true;
-            const initialDirectLength = directRules.length;
-            directRules = directRules.filter(r => !r.endsWith(`,${domain}`));
-            if (directRules.length < initialDirectLength) ruleFound = true;
-            if (ruleFound) successes.push(domain);
-            else failures.push(`未找到: ${domain}`);
-        }
-    }
+  const firstCommaIndex = normalized.indexOf(',');
+  if (firstCommaIndex === -1) return null;
 
-    // 3. 准备报告和最终数据
-    let report = '';
-    switch (command) {
-        case 'set': report = buildReport('设置/修改操作完成！', successes, failures); break;
-        case 'move': report = buildReport('移动操作完成！', successes, failures, (s) => `${s.originalRule} -> ${s.targetList}`); break;
-        case 'delete': report = buildReport('删除操作完成！', successes, failures); break;
-    }
-    
-    return {
-        report,
-        proxyData: proxyRules.join('\n'),
-        directData: directRules.join('\n'),
-    };
+  const type = normalizeRuleType(normalized.slice(0, firstCommaIndex));
+  const domain = normalizeDomain(normalized.slice(firstCommaIndex + 1));
+  if (!type || !domain) return null;
+
+  return {
+    raw: `${type},${domain}`,
+    type,
+    domain,
+  };
 }
 
+function stringifyRules(ruleMap) {
+  return Array.from(ruleMap.values()).join('\n');
+}
 
-async function handleTelegramUpdate(update, env) {
-  if (!update.message || !update.message.text) return;
+function parseRulesText(rulesText) {
+  const ruleMap = new Map();
+  const invalidLines = [];
 
-  const message = update.message;
-  const chatId = message.chat.id;
-  const text = message.text.trim();
-
-  const authorizedUsers = env.AUTHORIZED_USERS.split(',');
-  if (!authorizedUsers.includes(chatId.toString())) {
-    await sendMessage(chatId, '您没有权限使用此机器人。', env);
-    return;
+  for (const line of String(rulesText || '').split('\n')) {
+    const parsed = parseRuleLine(line);
+    if (!parsed) {
+      if (normalizeInputLine(line)) invalidLines.push(normalizeInputLine(line));
+      continue;
+    }
+    ruleMap.set(parsed.domain, parsed.raw);
   }
 
-  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
-  if (lines.length === 0) return;
+  return { ruleMap, invalidLines };
+}
 
-  const firstLine = lines[0];
-  const commandMatch = firstLine.match(/^\/(\w+)/);
-  if (!commandMatch) return;
-  
-  const command = commandMatch[1].toLowerCase();
-  const dataLines = lines.slice(1);
-
-  const isBatchCommand = ['set', 'move', 'delete'].includes(command) && dataLines.length > 0;
-
-  if (!isBatchCommand) {
-    // 处理简单命令...
-    switch (command) {
-      case 'start':
-        const supportedTypes = getSupportedTypes(env);
-        const typesText = supportedTypes.map(t => `\`${t}\``).join(', ');
-        const startMessage = `欢迎使用规则列表管理机器人\\!\n\n*命令功能说明*:\n\n*1️⃣ 查看列表*\n\`/proxyList\` \\- 显示 PROXY 列表\n\`/directList\` \\- 显示 DIRECT 列表\n\n*2️⃣ 批量设置或修改*\n命令: \`/set\`\n此命令用于添加新规则，或修改已有规则的类型/所属列表。如果域名已存在，旧规则会被完全覆盖。\n*格式*: \`<类型>,<域名>,<PROXY|DIRECT>\`\n*支持的类型*: ${typesText}\n\n*3️⃣ 批量移动*\n命令: \`/move\`\n此命令仅用于快速地将域名在 PROXY 和 DIRECT 列表之间移动。\n*格式*: \`<域名>,<PROXY|DIRECT>\`\n\n*4️⃣ 批量删除*\n命令: \`/delete\`\n只需提供域名，机器人会自动在两个列表中查找并删除。\n*格式*: 在下一行开始，每行一个域名`;
-        await sendMessage(chatId, startMessage, env, 'MarkdownV2');
-        break;
-      case 'proxylist':
-        await showList(chatId, env, 'proxy_rules', 'PROXY 代理列表');
-        break;
-      case 'directlist':
-        await showList(chatId, env, 'direct_rules', 'DIRECT 直连列表');
-        break;
-      default:
-        await sendMessage(chatId, '未知命令。发送 /start 查看帮助。', env);
-    }
-    return;
+async function sendTelegramRequest(method, payload, env) {
+  const token = env?.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    throw new Error('TELEGRAM_BOT_TOKEN 未配置');
   }
 
-  let processingMessageId = null;
-  try {
-    const initialResponse = await sendMessage(chatId, '⌛️ 正在处理您的请求，请稍候...', env);
-    if (initialResponse && initialResponse.ok) {
-        const result = await initialResponse.json();
-        processingMessageId = result.result.message_id;
+  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Telegram API 请求失败: ${response.status} ${errorText}`);
+  }
+
+  const result = await response.json();
+  if (!result.ok) {
+    throw new Error(`Telegram API 返回异常: ${JSON.stringify(result)}`);
+  }
+
+  return result.result;
+}
+
+async function sendMessage(chatId, text, env, parseMode = '') {
+  const payload = { chat_id: chatId, text };
+  if (parseMode) payload.parse_mode = parseMode;
+  return sendTelegramRequest('sendMessage', payload, env);
+}
+
+async function editMessage(chatId, messageId, text, env, parseMode = 'MarkdownV2') {
+  return sendTelegramRequest(
+    'editMessageText',
+    {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: parseMode,
+    },
+    env,
+  );
+}
+
+async function getRuleLists(env) {
+  const [proxyRulesText, directRulesText] = await Promise.all([
+    env.RULE_STORE.get(KV_KEYS.PROXY, 'text'),
+    env.RULE_STORE.get(KV_KEYS.DIRECT, 'text'),
+  ]);
+
+  const proxyParsed = parseRulesText(proxyRulesText || '');
+  const directParsed = parseRulesText(directRulesText || '');
+
+  return {
+    proxyRules: proxyParsed.ruleMap,
+    directRules: directParsed.ruleMap,
+    invalidRules: [
+      ...proxyParsed.invalidLines.map((line) => `${KV_KEYS.PROXY}: ${line}`),
+      ...directParsed.invalidLines.map((line) => `${KV_KEYS.DIRECT}: ${line}`),
+    ],
+  };
+}
+
+function buildReport(title, successes, failures, successFormatter = (item) => item) {
+  let report = `*${escapeMarkdown(title)}*\n\n`;
+
+  if (successes.length > 0) {
+    const successHeader = `✅ 成功 (${successes.length}条):`;
+    report += `*${escapeMarkdown(successHeader)}*\n`;
+    report += `\`\`\`\n${successes.map((item) => successFormatter(item)).join('\n')}\n\`\`\`\n`;
+  }
+
+  if (failures.length > 0) {
+    const failureHeader = `❌ 失败 (${failures.length}条):`;
+    report += `*${escapeMarkdown(failureHeader)}*\n`;
+    report += `\`\`\`\n${failures.join('\n')}\n\`\`\``;
+  }
+
+  if (successes.length === 0 && failures.length === 0) {
+    report += escapeMarkdown('没有提供有效数据。');
+  }
+
+  return report;
+}
+
+function buildInvalidRuleWarnings(invalidRules) {
+  if (!invalidRules.length) return [];
+  return invalidRules.map((line) => `检测到存量异常规则，已在本次保存时自动忽略: ${line}`);
+}
+
+function removeDomainFromAllLists(domain, lists) {
+  lists.proxyRules.delete(domain);
+  lists.directRules.delete(domain);
+}
+
+function addRuleToList(listKey, ruleLine, lists) {
+  if (listKey === KV_KEYS.PROXY) {
+    lists.proxyRules.set(parseRuleLine(ruleLine).domain, ruleLine);
+    return;
+  }
+  lists.directRules.set(parseRuleLine(ruleLine).domain, ruleLine);
+}
+
+function processSetCommand(lines, env, lists) {
+  const successes = [];
+  const failures = buildInvalidRuleWarnings(lists.invalidRules);
+  const supportedTypes = getSupportedTypes(env);
+
+  for (const rawLine of lines) {
+    const line = normalizeInputLine(rawLine);
+    if (!line) continue;
+
+    const parts = line.split(',').map((item) => item.trim());
+    if (parts.length !== 3) {
+      failures.push(`格式错误: ${line}`);
+      continue;
+    }
+
+    const [typeInput, domainInput, listNameInput] = parts;
+    const type = normalizeRuleType(typeInput);
+    const domain = normalizeDomain(domainInput);
+    const listKey = getKvKey(listNameInput);
+
+    if (!type || !domain || !listNameInput) {
+      failures.push(`内容不全: ${line}`);
+      continue;
+    }
+
+    if (!supportedTypes.includes(type)) {
+      failures.push(`类型不支持: ${line}`);
+      continue;
+    }
+
+    if (!listKey) {
+      failures.push(`列表名称错误: ${line}`);
+      continue;
+    }
+
+    removeDomainFromAllLists(domain, lists);
+    addRuleToList(listKey, `${type},${domain}`, lists);
+    successes.push(`${type},${domain},${getListDisplayNameByKey(listKey)}`);
+  }
+
+  return {
+    report: buildReport('设置/修改操作完成！', successes, failures),
+    proxyData: stringifyRules(lists.proxyRules),
+    directData: stringifyRules(lists.directRules),
+  };
+}
+
+function processMoveCommand(lines, lists) {
+  const successes = [];
+  const failures = buildInvalidRuleWarnings(lists.invalidRules);
+
+  for (const rawLine of lines) {
+    const line = normalizeInputLine(rawLine);
+    if (!line) continue;
+
+    const parts = line.split(',').map((item) => item.trim());
+    if (parts.length !== 2) {
+      failures.push(`格式错误: ${line}`);
+      continue;
+    }
+
+    const [domainInput, listNameInput] = parts;
+    const domain = normalizeDomain(domainInput);
+    const listKey = getKvKey(listNameInput);
+
+    if (!domain || !listNameInput) {
+      failures.push(`内容不全: ${line}`);
+      continue;
+    }
+
+    if (!listKey) {
+      failures.push(`列表名称错误: ${line}`);
+      continue;
+    }
+
+    const sourceRule = lists.proxyRules.get(domain) || lists.directRules.get(domain);
+    if (!sourceRule) {
+      failures.push(`未找到: ${domain}`);
+      continue;
+    }
+
+    removeDomainFromAllLists(domain, lists);
+    addRuleToList(listKey, sourceRule, lists);
+    successes.push({ originalRule: sourceRule, targetList: getListDisplayNameByKey(listKey) });
+  }
+
+  return {
+    report: buildReport('移动操作完成！', successes, failures, (item) => `${item.originalRule} -> ${item.targetList}`),
+    proxyData: stringifyRules(lists.proxyRules),
+    directData: stringifyRules(lists.directRules),
+  };
+}
+
+function processDeleteCommand(lines, lists) {
+  const successes = [];
+  const failures = buildInvalidRuleWarnings(lists.invalidRules);
+
+  for (const rawLine of lines) {
+    const domain = normalizeDomain(rawLine);
+    if (!domain) continue;
+
+    const existedInProxy = lists.proxyRules.delete(domain);
+    const existedInDirect = lists.directRules.delete(domain);
+
+    if (existedInProxy || existedInDirect) {
+      successes.push(domain);
     } else {
-        console.error("Failed to send initial message:", await initialResponse.text());
-        return;
+      failures.push(`未找到: ${domain}`);
     }
+  }
 
-    // 【核心重构】在这里调用纯计算函数
+  return {
+    report: buildReport('删除操作完成！', successes, failures),
+    proxyData: stringifyRules(lists.proxyRules),
+    directData: stringifyRules(lists.directRules),
+  };
+}
+
+async function processRules(command, lines, env) {
+  const lists = await getRuleLists(env);
+
+  switch (command) {
+    case 'set':
+      return processSetCommand(lines, env, lists);
+    case 'move':
+      return processMoveCommand(lines, lists);
+    case 'delete':
+      return processDeleteCommand(lines, lists);
+    default:
+      return {
+        report: buildReport('操作未执行', [], [`不支持的命令: ${command}`]),
+        proxyData: stringifyRules(lists.proxyRules),
+        directData: stringifyRules(lists.directRules),
+      };
+  }
+}
+
+async function showList(chatId, env, listKey, title) {
+  const rules = (await env.RULE_STORE.get(listKey, 'text')) || `# ${title}为空。`;
+  await sendMessage(chatId, `*${escapeMarkdown(title)}*\n\`\`\`\n${rules}\n\`\`\``, env, 'MarkdownV2');
+}
+
+function buildStartMessage(env) {
+  const typesText = getSupportedTypes(env).map((type) => `\`${type}\``).join(', ');
+  return `欢迎使用规则列表管理机器人\\!\n\n*命令功能说明*:\n\n*1️⃣ 查看列表*\n\`/proxyList\` \\- 显示 PROXY 列表\n\`/directList\` \\- 显示 DIRECT 列表\n\n*2️⃣ 批量设置或修改*\n命令: \`/set\`\n此命令用于添加新规则，或修改已有规则的类型/所属列表。如果域名已存在，旧规则会被完全覆盖。\n*格式*: \`<类型>,<域名>,<PROXY|DIRECT>\`\n*支持的类型*: ${typesText}\n\n*3️⃣ 批量移动*\n命令: \`/move\`\n此命令仅用于快速地将域名在 PROXY 和 DIRECT 列表之间移动。\n*格式*: \`<域名>,<PROXY|DIRECT>\`\n\n*4️⃣ 批量删除*\n命令: \`/delete\`\n只需提供域名，机器人会自动在两个列表中查找并删除。\n*格式*: 在下一行开始，每行一个域名`;
+}
+
+async function handleTelegramCommand(command, chatId, env) {
+  if (command === 'start') {
+    await sendMessage(chatId, buildStartMessage(env), env, 'MarkdownV2');
+    return;
+  }
+
+  const listCommand = LIST_COMMANDS[command];
+  if (listCommand) {
+    await showList(chatId, env, listCommand.key, listCommand.title);
+    return;
+  }
+
+  await sendMessage(chatId, '未知命令。发送 /start 查看帮助。', env);
+}
+
+async function handleBatchCommand(command, dataLines, chatId, env, waitUntil) {
+  let processingMessageId = null;
+
+  try {
+    const initialMessage = await sendMessage(chatId, '⌛️ 正在处理您的请求，请稍候...', env);
+    processingMessageId = initialMessage.message_id;
+
     const { report, proxyData, directData } = await processRules(command, dataLines, env);
-    
-    // 【核心重构】将 KV 写入操作放到一个独立的 Promise 中
     const kvWritePromise = Promise.all([
-        env.RULE_STORE.put('proxy_rules', proxyData),
-        env.RULE_STORE.put('direct_rules', directData)
+      env.RULE_STORE.put(KV_KEYS.PROXY, proxyData),
+      env.RULE_STORE.put(KV_KEYS.DIRECT, directData),
     ]);
 
-    // 【核心重构】将这个 Promise 交给 waitUntil()，确保它一定能完成
-    // 注意：在实际的 fetch handler 中，这个 env 来自 ctx，但在这里我们模拟
-    if (env.waitUntil) { // 在 Cloudflare 环境中，env 对象有这个方法
-        env.waitUntil(kvWritePromise);
-    } else { // 在本地测试或旧环境中，直接 await
-        await kvWritePromise;
+    if (typeof waitUntil === 'function') {
+      waitUntil(kvWritePromise);
+    } else {
+      await kvWritePromise;
     }
 
-    // 无论写入是否完成，立即更新报告给用户
     if (report) {
       await editMessage(chatId, processingMessageId, report, env);
     }
   } catch (error) {
-    console.error("Error during batch processing:", error.stack);
+    console.error('Error during batch processing:', error?.stack || error);
     if (processingMessageId) {
-        const errorMessage = '❌ *处理失败\\!* \n\n机器人后台发生意外错误，请检查 Cloudflare Worker 日志获取详情。';
-        await editMessage(chatId, processingMessageId, errorMessage, env);
+      const errorMessage = '❌ *处理失败\\!* \n\n机器人后台发生意外错误，请检查 Cloudflare Worker 日志获取详情。';
+      await editMessage(chatId, processingMessageId, errorMessage, env);
     }
   }
+}
+
+async function handleTelegramUpdate(update, env, waitUntil) {
+  if (!update?.message?.text) return;
+
+  const message = update.message;
+  const chatId = message.chat.id;
+  const text = normalizeInputLine(message.text);
+  if (!text) return;
+
+  const authorizedUsers = parseAuthorizedUsers(env);
+  if (!authorizedUsers.has(String(chatId))) {
+    await sendMessage(chatId, '您没有权限使用此机器人。', env);
+    return;
+  }
+
+  const lines = text.split('\n').map(normalizeInputLine).filter(Boolean);
+  if (!lines.length) return;
+
+  const commandMatch = lines[0].match(/^\/(\w+)/);
+  if (!commandMatch) return;
+
+  const command = commandMatch[1].toLowerCase();
+  const dataLines = lines.slice(1);
+
+  if (BATCH_COMMANDS.has(command) && dataLines.length > 0) {
+    await handleBatchCommand(command, dataLines, chatId, env, waitUntil);
+    return;
+  }
+
+  await handleTelegramCommand(command, chatId, env);
 }
 
 async function handleListRequest(env, listKey) {
   const rules = await env.RULE_STORE.get(listKey, 'text');
   if (rules === null || rules.trim() === '') {
-    return new Response(`# ${listKey === 'proxy_rules' ? 'Proxy' : 'Direct'} 列表为空。`, {
+    return new Response(`# ${listKey === KV_KEYS.PROXY ? 'Proxy' : 'Direct'} 列表为空。`, {
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     });
   }
+
   return new Response(rules, {
     headers: { 'Content-Type': 'text/plain; charset=utf-8' },
   });
 }
-
-// =================================================================
-// 2. 主导出对象 (Main Exported Object)
-// =================================================================
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === '/proxyList.list') {
-      return handleListRequest(env, 'proxy_rules');
+      return handleListRequest(env, KV_KEYS.PROXY);
     }
+
     if (url.pathname === '/directList.list') {
-      return handleListRequest(env, 'direct_rules');
+      return handleListRequest(env, KV_KEYS.DIRECT);
     }
 
     if (url.pathname === `/bot${env.TELEGRAM_BOT_TOKEN}`) {
       const update = await request.json();
-      // 【核心重构】在这里传递 ctx 给 handleTelegramUpdate
-      // 我们将 waitUntil 方法附加到 env 对象上传递下去
-      env.waitUntil = ctx.waitUntil.bind(ctx);
-      ctx.waitUntil(handleTelegramUpdate(update, env));
+      ctx.waitUntil(handleTelegramUpdate(update, env, ctx.waitUntil.bind(ctx)));
       return new Response('OK');
     }
 
