@@ -308,9 +308,6 @@ https://your-worker.workers.dev/marked?token=your_pull_token
 2. 之前已经拉取过一次，标记已被清空
 3. 没有使用 KV，Worker 实例重启后内存数据丢失
 
-### 11.3 为什么推荐使用 KV？
-
-因为内存存储只适合测试环境。正式环境中，Cloudflare Worker 可能会重启、切换实例或回收内存，这时 [`MEMORY_STORE`](tgBotReMSG.js:17) 中的数据无法保证保留。
 
 ---
 
