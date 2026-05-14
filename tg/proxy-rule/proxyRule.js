@@ -7,7 +7,6 @@ const KV_KEYS = {
   DIRECT: 'direct_rules',
 };
 
-// 默认支持的三种类型
 const DEFAULT_SUPPORTED_TYPES = ['DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD'];
 
 const LIST_COMMANDS = {
@@ -45,6 +44,42 @@ async function getRuleLists(env) {
 }
 
 /**
+ * 帮助信息 (使用 HTML 格式避免 MarkdownV2 转义报错)
+ */
+async function sendHelpMessage(chatId, env, workerUrl) {
+  const helpText = `
+<b>🤖 分流规则管理助手</b>
+
+这是一个基于 Cloudflare KV 的域名分流管理工具。
+
+<b>🛠 使用方法：</b>
+• <b>添加/编辑：</b> 直接发送域名（如 google.com），机器人将弹出操作菜单。
+• <b>查看列表：</b> 点击下方按钮或输入命令查看现有规则。
+
+<b>📝 命令列表：</b>
+/proxylist - 查看代理列表
+/directlist - 查看直连列表
+/start - 显示此帮助信息
+
+<b>🔗 订阅链接：</b>
+<code>${workerUrl}proxyList.list</code>
+<code>${workerUrl}directList.list</code>
+
+<b>💡 匹配说明：</b>
+• <b>DOMAIN</b>: 精确匹配域名
+• <b>DOMAIN-SUFFIX</b>: 匹配域名及其子域名
+• <b>DOMAIN-KEYWORD</b>: 包含关键字匹配
+  `.trim();
+
+  await sendTelegramRequest('sendMessage', { 
+    chat_id: chatId, 
+    text: helpText, 
+    parse_mode: 'HTML',
+    disable_web_page_preview: true
+  }, env);
+}
+
+/**
  * 核心 UI 构建
  */
 async function handleDomainInteraction(chatId, domain, env) {
@@ -65,74 +100,33 @@ async function handleDomainInteraction(chatId, domain, env) {
   const keyboard = { inline_keyboard: [] };
 
   if (currentRule) {
-    // 【编辑模式】
     const oppositeList = currentList === 'PROXY' ? 'DIRECT' : 'PROXY';
-    // 过滤掉当前类型，显示另外两种供切换
     const otherTypes = types.filter(t => t !== currentRule.type);
-
     keyboard.inline_keyboard.push([{ text: `📍 当前: ${currentList} | ${currentRule.type}`, callback_data: 'ignore' }]);
-    
-    // 第一行：切换到同列表的其他类型
-    keyboard.inline_keyboard.push(
-      otherTypes.map(t => ({ text: `🔄 ${t}`, callback_data: `type:${domain}:${t}` }))
-    );
-    
-    // 第二行：移动到另一个列表
-    keyboard.inline_keyboard.push([
-      { text: `🚀 移至 ${oppositeList}`, callback_data: `move:${domain}:${oppositeList}` }
-    ]);
+    keyboard.inline_keyboard.push(otherTypes.map(t => ({ text: `🔄 ${t}`, callback_data: `type:${domain}:${t}` })));
+    keyboard.inline_keyboard.push([{ text: `🚀 移至 ${oppositeList}`, callback_data: `move:${domain}:${oppositeList}` }]);
+    keyboard.inline_keyboard.push([{ text: `🗑️ 删除`, callback_data: `del:${domain}` }, { text: `❌ 取消`, callback_data: 'cancel:msg' }]);
 
-    // 第三行：删除与取消
-    keyboard.inline_keyboard.push([
-      { text: `🗑️ 删除`, callback_data: `del:${domain}` },
-      { text: `❌ 关闭`, callback_data: `cancel:msg` }
-    ]);
-
-    const status = `🔍 *规则管理*\n\n域 名: \`${escapeMarkdown(domain)}\`\n该域名已存在，您可以执行以下操作：`;
+    const status = `🔍 *规则管理*\n\n域 名: \`${escapeMarkdown(domain)}\`\n该域名已存在，您可以执行操作：`;
     await sendTelegramRequest('sendMessage', { chat_id: chatId, text: status, parse_mode: 'MarkdownV2', reply_markup: keyboard }, env);
-
   } else {
-    // 【添加模式】
-    
-    // PROXY 分区
     keyboard.inline_keyboard.push([{ text: '━━━━━━━ 🚀 PROXY ━━━━━━━', callback_data: 'ignore' }]);
-    keyboard.inline_keyboard.push(
-      types.map(t => ({ text: t, callback_data: `add:${domain}:PROXY:${t}` }))
-    );
-
-    // DIRECT 分区
+    keyboard.inline_keyboard.push(types.map(t => ({ text: t, callback_data: `add:${domain}:PROXY:${t}` })));
     keyboard.inline_keyboard.push([{ text: '━━━━━━━ 🏠 DIRECT ━━━━━━━', callback_data: 'ignore' }]);
-    keyboard.inline_keyboard.push(
-      types.map(t => ({ text: t, callback_data: `add:${domain}:DIRECT:${t}` }))
-    );
-
-    // 取消
+    keyboard.inline_keyboard.push(types.map(t => ({ text: t, callback_data: `add:${domain}:DIRECT:${t}` })));
     keyboard.inline_keyboard.push([{ text: '❌ 取消', callback_data: 'cancel:msg' }]);
 
-    const status = `🆕 *识别到新域名*\n\n域 名: \`${escapeMarkdown(domain)}\`\n请选择要添加到的列表及匹配类型：`;
+    const status = `🆕 *识别到新域名*\n\n域 名: \`${escapeMarkdown(domain)}\`\n请选择列表及匹配类型：`;
     await sendTelegramRequest('sendMessage', { chat_id: chatId, text: status, parse_mode: 'MarkdownV2', reply_markup: keyboard }, env);
   }
 }
 
-/**
- * 回调处理
- */
 async function handleCallbackQuery(query, env) {
   const { id, data, message } = query;
-  const chatId = message.chat.id;
-
-  if (data === 'ignore') {
-    await sendTelegramRequest('answerCallbackQuery', { callback_query_id: id }, env);
-    return;
-  }
+  if (data === 'ignore') return await sendTelegramRequest('answerCallbackQuery', { callback_query_id: id }, env);
+  if (data === 'cancel:msg') return await sendTelegramRequest('deleteMessage', { chat_id: message.chat.id, message_id: message.message_id }, env);
 
   const [action, domain, p1, p2] = data.split(':');
-
-  if (action === 'cancel') {
-    await sendTelegramRequest('deleteMessage', { chat_id: chatId, message_id: message.message_id }, env);
-    return;
-  }
-
   const lists = await getRuleLists(env);
   const clear = (d) => { lists[KV_KEYS.PROXY].delete(d); lists[KV_KEYS.DIRECT].delete(d); };
   let feedbackText = '';
@@ -142,7 +136,7 @@ async function handleCallbackQuery(query, env) {
       clear(domain);
       const key = p1 === 'PROXY' ? KV_KEYS.PROXY : KV_KEYS.DIRECT;
       lists[key].set(domain, { raw: `${p2},${domain}`, type: p2, domain });
-      feedbackText = `✅ 已添加至 ${p1} [${p2}]`;
+      feedbackText = `✅ 已添加至 ${p1}`;
     } else if (action === 'del') {
       clear(domain);
       feedbackText = `🗑️ 已删除规则`;
@@ -156,22 +150,19 @@ async function handleCallbackQuery(query, env) {
     } else if (action === 'type') {
       const currentListKey = lists[KV_KEYS.PROXY].has(domain) ? KV_KEYS.PROXY : KV_KEYS.DIRECT;
       lists[currentListKey].set(domain, { raw: `${p1},${domain}`, type: p1, domain });
-      feedbackText = `📝 类型已改为 ${p1}`;
+      feedbackText = `📝 改为 ${p1}`;
     }
 
-    // 保存 KV
-    const pData = Array.from(lists[KV_KEYS.PROXY].values()).map(r => r.raw).join('\n');
-    const dData = Array.from(lists[KV_KEYS.DIRECT].values()).map(r => r.raw).join('\n');
     await Promise.all([
-      env.RULE_STORE.put(KV_KEYS.PROXY, pData),
-      env.RULE_STORE.put(KV_KEYS.DIRECT, dData)
+      env.RULE_STORE.put(KV_KEYS.PROXY, Array.from(lists[KV_KEYS.PROXY].values()).map(r => r.raw).join('\n')),
+      env.RULE_STORE.put(KV_KEYS.DIRECT, Array.from(lists[KV_KEYS.DIRECT].values()).map(r => r.raw).join('\n'))
     ]);
 
     await sendTelegramRequest('answerCallbackQuery', { callback_query_id: id, text: feedbackText }, env);
     await sendTelegramRequest('editMessageText', {
-      chat_id: chatId,
+      chat_id: message.chat.id,
       message_id: message.message_id,
-      text: `${feedbackText}\n\n域名: \`${domain}\`\n配置已同步。`,
+      text: `${feedbackText}\n域名: \`${domain}\``,
       parse_mode: 'MarkdownV2'
     }, env);
   } catch (e) {
@@ -179,29 +170,31 @@ async function handleCallbackQuery(query, env) {
   }
 }
 
-async function handleTelegramUpdate(update, env, ctx) {
-  const callback = update.callback_query;
-  const message = update.message;
+async function handleTelegramUpdate(update, env, ctx, workerUrl) {
+  const msg = update.message;
+  const cb = update.callback_query;
+  const userId = cb ? cb.from.id : msg?.from?.id;
 
-  // 获取用户 ID
-  const userId = callback ? callback.from.id : message?.from?.id;
   if (!userId || !parseAuthorizedUsers(env).has(String(userId))) return;
 
-  if (callback) {
-    await handleCallbackQuery(callback, env);
-    return;
-  }
+  if (cb) return await handleCallbackQuery(cb, env);
 
-  if (message?.text) {
-    const text = message.text.trim();
+  if (msg?.text) {
+    const text = msg.text.trim();
     if (text.startsWith('/')) {
-      const cmd = text.split(' ')[0].replace('/', '').toLowerCase();
-      if (LIST_COMMANDS[cmd]) {
-        const rules = (await env.RULE_STORE.get(LIST_COMMANDS[cmd].key)) || '# 列表为空';
-        await sendTelegramRequest('sendMessage', { chat_id: message.chat.id, text: `*${LIST_COMMANDS[cmd].title}*\n\`\`\`\n${rules}\n\`\`\``, parse_mode: 'MarkdownV2' }, env);
+      const cmd = text.toLowerCase().split(' ')[0].split('@')[0]; // 处理 /start@bot_name 格式
+      if (cmd === '/start') {
+        await sendHelpMessage(msg.chat.id, env, workerUrl);
+      } else if (LIST_COMMANDS[cmd.substring(1)]) {
+        const rules = (await env.RULE_STORE.get(LIST_COMMANDS[cmd.substring(1)].key)) || '# 列表为空';
+        await sendTelegramRequest('sendMessage', { 
+          chat_id: msg.chat.id, 
+          text: `*${LIST_COMMANDS[cmd.substring(1)].title}*\n\`\`\`\n${rules}\n\`\`\``, 
+          parse_mode: 'MarkdownV2' 
+        }, env);
       }
-    } else if (!text.includes(' ') && !text.includes(',') && !text.includes('\n')) {
-      await handleDomainInteraction(message.chat.id, text, env);
+    } else if (/^[a-zA-Z0-9\-\.\*]+$/.test(text) && text.includes('.')) {
+      await handleDomainInteraction(msg.chat.id, text, env);
     }
   }
 }
@@ -209,12 +202,14 @@ async function handleTelegramUpdate(update, env, ctx) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname === '/proxyList.list') return new Response(await env.RULE_STORE.get(KV_KEYS.PROXY) || '', { headers: { 'Content-Type': 'text/plain' } });
-    if (url.pathname === '/directList.list') return new Response(await env.RULE_STORE.get(KV_KEYS.DIRECT) || '', { headers: { 'Content-Type': 'text/plain' } });
+    const workerUrl = `${url.origin}/`;
+
+    if (url.pathname === '/proxyList.list') return new Response(await env.RULE_STORE.get(KV_KEYS.PROXY) || '', { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+    if (url.pathname === '/directList.list') return new Response(await env.RULE_STORE.get(KV_KEYS.DIRECT) || '', { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
     
     if (request.method === 'POST') {
       const update = await request.json();
-      ctx.waitUntil(handleTelegramUpdate(update, env, ctx));
+      ctx.waitUntil(handleTelegramUpdate(update, env, ctx, workerUrl));
     }
     return new Response('OK');
   }
