@@ -693,8 +693,8 @@ async function handleCallback(query, env, ctx) {
 
   // --- 删除二次确认回调处理 ---
   if (data.startsWith("confirm_del:")) {
-      const [_, action] = data.split(":");
-      const tempKey = `del_task:${chatId}:${messageId}`;
+      const [_, action, targetMsgId] = data.split(":");
+      const tempKey = `del_task:${chatId}:${targetMsgId}`;
 
       // A. 取消操作
       if (action === "no") {
@@ -727,13 +727,17 @@ async function handleCallback(query, env, ctx) {
           const deleteResult = await deleteFromImageHost(path, env);
 
           if (deleteResult.success) {
-              // 1. 图床文件删除成功后，仅更新并清理提示消息
+              // 1. 物理删除成功后，立即撤回频道原图 (targetMsgId)
+              await deleteMessage(chatId, targetMsgId, env);
+              
+              // 2. 更新提示面板文字
               await editMessageText(chatId, messageId, `✅ <b>图床删除成功</b>\n\n文件已从存储中移除。\n\n相关提示将在 12 秒内自动清理。`, env);
               
-              // 2. 清理命令消息与确认面板
+              // 3. 【完全复用 /info 逻辑】
+              // 传入命令消息 ID (cmdId) 和 面板消息 ID (messageId)
               ctx.waitUntil(delayDelete(chatId, [cmdId, messageId], env));
               
-              // 3. 清理临时 KV (这个操作很快，直接执行即可)
+              // 4. 清理临时 KV (这个操作很快，直接执行即可)
               await env.TG_KV.delete(tempKey);
           } else {
               // 删除失败：保留原图，仅报错
@@ -1291,9 +1295,9 @@ async function handleDeleteCommand(msg, chatId, env, ctx) {
         const deletePath = targetData.id; 
         const fileName = (targetData.metadata && targetData.metadata.FileName) || "未知文件名";
 
-        // 存入 TG_KV (临时任务缓存)，以确认面板消息 ID 作为任务标识
+        // 存入 TG_KV (临时任务缓存)
         if (env.TG_KV) {
-            const tempKey = `del_task:${chatId}:${feedbackId}`;
+            const tempKey = `del_task:${chatId}:${targetMsg.message_id}`;
             await env.TG_KV.put(tempKey, JSON.stringify({
                 path: deletePath,
                 cmdId: msg.message_id
@@ -1303,12 +1307,12 @@ async function handleDeleteCommand(msg, chatId, env, ctx) {
         // 修改确认面板的文字显示
         const keyboard = {
             inline_keyboard: [[
-                { text: "✅ 确认删除", callback_data: "confirm_del:yes" },
-                { text: "❌ 取消操作", callback_data: "confirm_del:no" }
+                { text: "✅ 确认删除", callback_data: `confirm_del:yes:${targetMsg.message_id}` },
+                { text: "❌ 取消操作", callback_data: `confirm_del:no:${targetMsg.message_id}` }
             ]]
         };
 
-        const confirmText = `⚠️ <b>确认从图床删除？</b>\n\n🆔 <b>文件路径 (ID):</b>\n<code>${deletePath}</code>\n\n📄 <b>原始名称:</b> <code>${fileName}</code>\n\n确认后将调用图床 API 物理删除文件。`;
+        const confirmText = `⚠️ <b>确认从图床删除？</b>\n\n🆔 <b>文件路径 (ID):</b>\n<code>${deletePath}</code>\n\n📄 <b>原始名称:</b> <code>${fileName}</code>\n\n确认后将物理删除文件并撤回此消息。`;
         
         await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`, {
             method: "POST", headers: { "Content-Type": "application/json" },
